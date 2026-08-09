@@ -103,6 +103,29 @@ func TestProvider_RecordSuccessAndFailureAdjustScore(t *testing.T) {
 	}
 }
 
+// TestProvider_RecordSuccessRecoversPastZeroAtZeroPriority proves the fix
+// for a previously silent bug: with Priority 0 (the zero value), baseScore
+// is 0, so the old clamp (baseScore*2 == 0) capped currentScore at 0
+// forever — a provider that failed enough to go unhealthy could never
+// climb back to a positive score no matter how many successes followed.
+func TestProvider_RecordSuccessRecoversPastZeroAtZeroPriority(t *testing.T) {
+	p := newTestProvider(t, newFakeEthClient(), ProviderConfig{Priority: 0})
+
+	for i := 0; i < 20; i++ {
+		p.RecordFailure(errors.New("boom"))
+	}
+	if p.IsAvailable() {
+		t.Fatal("expected the provider to become unavailable after enough failures")
+	}
+
+	for i := 0; i < 50; i++ {
+		p.RecordSuccess()
+	}
+	if got := p.Score(); got <= 0 {
+		t.Fatalf("expected enough successes to recover a positive score even at Priority 0, got %v", got)
+	}
+}
+
 func TestProvider_IsAvailableHasNoSideEffectsOnQuota(t *testing.T) {
 	p := newTestProvider(t, newFakeEthClient(), ProviderConfig{
 		Quota: QuotaConfig{Limit: 1, Period: time.Minute},
@@ -234,10 +257,67 @@ func TestProvider_RetriesTransientFailures(t *testing.T) {
 	}
 }
 
+// TestProvider_QuotaConsumedPerRetryAttempt proves quota is charged for
+// every physical RPC attempt a retry makes, not once per logical call —
+// previously a single Consume() up front let MaxAttempts retries all fire
+// against the real upstream uncharged, silently exceeding a per-request
+// metered quota (e.g. Alchemy compute units).
+func TestProvider_QuotaConsumedPerRetryAttempt(t *testing.T) {
+	client := newFakeEthClient()
+	client.setBlockNumberErr(errors.New("timeout"))
+	p := newTestProvider(t, client, ProviderConfig{
+		Retry: RetryConfig{MaxAttempts: 3, BaseDelay: time.Millisecond},
+		Quota: QuotaConfig{Limit: 2, Period: time.Hour},
+	})
+
+	_, err := p.BlockNumber(context.Background())
+	if !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("expected the 3rd retry attempt to be blocked by quota, got %v", err)
+	}
+	if calls := atomic.LoadInt32(&client.blockNumberCalls); calls != 2 {
+		t.Fatalf("expected quota (limit 2) to cap actual RPC attempts at 2, got %d", calls)
+	}
+}
+
+// TestProvider_RequestTimeoutBoundsAStuckCall proves a configured
+// RequestTimeout bounds a single RPC attempt instead of letting it hang
+// forever on a stuck upstream (previously the only cancellation was the
+// Provider's own Close/Stop, which could be arbitrarily far away).
+func TestProvider_RequestTimeoutBoundsAStuckCall(t *testing.T) {
+	client := newFakeEthClient()
+	client.setBlockUntilCtxDone(true)
+	p := newTestProvider(t, client, ProviderConfig{
+		RequestTimeout: 20 * time.Millisecond,
+	})
+
+	start := time.Now()
+	_, err := p.BlockNumber(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error once the request timeout fires")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("expected RequestTimeout (20ms) to bound the stuck call, took %v", elapsed)
+	}
+}
+
 func TestProvider_CloseClosesUnderlyingClient(t *testing.T) {
 	client := newFakeEthClient()
 	p := newTestProvider(t, client, ProviderConfig{})
 	p.Close()
+	if closed := atomic.LoadInt32(&client.closed); closed != 1 {
+		t.Fatalf("expected underlying client to be closed exactly once, got %d", closed)
+	}
+}
+
+func TestProvider_CloseIsIdempotentSafe(t *testing.T) {
+	client := newFakeEthClient()
+	p := newTestProvider(t, client, ProviderConfig{})
+
+	p.Close()
+	p.Close() // must not double-close the underlying client
+
 	if closed := atomic.LoadInt32(&client.closed); closed != 1 {
 		t.Fatalf("expected underlying client to be closed exactly once, got %d", closed)
 	}

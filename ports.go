@@ -51,6 +51,10 @@ type RPCProvider interface {
 	TransactionByHash(ctx context.Context, hash common.Hash) (*types.Transaction, bool, error)
 	TransactionReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error)
 	FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error)
+	// SubscribeNewHead is a long-lived streaming subscription, not a
+	// request/response call — implementations (see Provider) deliberately
+	// don't run it through retry/circuit-breaker/quota/RequestTimeout, and
+	// don't record success/failure against the provider's health score.
 	SubscribeNewHead(ctx context.Context, ch chan *types.Header) (ethereum.Subscription, error)
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
 	BlockNumber(ctx context.Context) (uint64, error)
@@ -118,6 +122,16 @@ type ScoreStorage interface {
 type QuotaStorage interface {
 	GetQuotaUsage(ctx context.Context, provider, quotaType string) (*QuotaUsage, error)
 	SetQuotaUsage(ctx context.Context, provider, quotaType string, used int, resetAt time.Time) error
+}
+
+// QuotaRestorer is implemented by an RPCProvider that can have previously
+// persisted quota usage (see QuotaStorage) applied back to it. It's checked
+// via type assertion, the same optional-capability pattern as
+// ScoreStorage/QuotaStorage themselves — RPCProvider fakes in tests, or any
+// implementation that doesn't track quota, simply don't implement it and
+// are skipped. *Provider implements it.
+type QuotaRestorer interface {
+	RestoreQuotaUsage(used int64, resetAt time.Time)
 }
 
 // Storage is the full persistence surface: ChainStorage plus the optional

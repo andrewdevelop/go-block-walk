@@ -25,16 +25,17 @@ import (
 type fakeEthClient struct {
 	mu sync.Mutex
 
-	blockNumber      uint64
-	blockNumberErr   error
-	headers          map[uint64]*types.Header
-	headerErr        error
-	logs             []types.Log
-	logsErr          error
-	closed           int32
-	filterLogsCalls  int32
-	blockNumberCalls int32
-	blockByNumberErr error
+	blockNumber       uint64
+	blockNumberErr    error
+	headers           map[uint64]*types.Header
+	headerErr         error
+	logs              []types.Log
+	logsErr           error
+	closed            int32
+	filterLogsCalls   int32
+	blockNumberCalls  int32
+	blockByNumberErr  error
+	blockUntilCtxDone bool
 }
 
 func newFakeEthClient() *fakeEthClient {
@@ -91,11 +92,28 @@ func (f *fakeEthClient) HeaderByNumber(ctx context.Context, number *big.Int) (*t
 func (f *fakeEthClient) BlockNumber(ctx context.Context) (uint64, error) {
 	atomic.AddInt32(&f.blockNumberCalls, 1)
 	f.mu.Lock()
+	blocks := f.blockUntilCtxDone
+	f.mu.Unlock()
+	if blocks {
+		// Simulates an upstream that never replies (e.g. a dropped TCP
+		// packet with no RST) — used to prove RequestTimeout actually
+		// bounds a stuck call instead of hanging forever.
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.blockNumberErr != nil {
 		return 0, f.blockNumberErr
 	}
 	return f.blockNumber, nil
+}
+
+func (f *fakeEthClient) setBlockUntilCtxDone(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.blockUntilCtxDone = v
 }
 
 func (f *fakeEthClient) BalanceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (*big.Int, error) {

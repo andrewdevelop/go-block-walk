@@ -78,6 +78,12 @@ func WithRetry(ctx context.Context, cfg RetryConfig, fn func(context.Context) er
 	return fmt.Errorf("%w: %d attempts exceeded, last error: %w", ErrRetriesExhausted, maxAttempts, lastErr)
 }
 
+// minBackoffDelay is the floor calculateBackoff never returns below, even
+// when BaseDelay is 0 — otherwise a misconfigured (but retry-enabled)
+// RetryConfig turns into a hot loop hammering the provider with no pause
+// between attempts at all.
+const minBackoffDelay = time.Millisecond
+
 func calculateBackoff(attempt int, cfg RetryConfig) time.Duration {
 	delay := float64(cfg.BaseDelay) * math.Pow(2, float64(attempt-1))
 	if cfg.MaxDelay > 0 && delay > float64(cfg.MaxDelay) {
@@ -86,5 +92,8 @@ func calculateBackoff(attempt int, cfg RetryConfig) time.Duration {
 	if cfg.Jitter {
 		delay += rand.Float64() * 0.5 * delay
 	}
-	return time.Duration(delay)
+	if d := time.Duration(delay); d > minBackoffDelay {
+		return d
+	}
+	return minBackoffDelay
 }

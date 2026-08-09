@@ -1,9 +1,35 @@
 package idx
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
+
+// isLocalDecodeError reports whether err is caused by go-ethereum being
+// unable to decode a transaction type locally (e.g. a chain upgrade
+// introducing a tx type — such as EIP-4844 blobs — ahead of the
+// go-ethereum version this binary was built with), rather than a
+// provider-side failure. Callers use this to distinguish "the provider is
+// fine, we just can't parse this block yet" from a real fault: Pool skips
+// penalizing the provider's health score for it, and Indexer skips the
+// block (logging a warning) instead of treating it as a transient error to
+// retry forever.
+//
+// Kept as a single shared classifier — Pool and Indexer used to each have
+// their own copy of this exact substring check, risking the two silently
+// diverging.
+func isLocalDecodeError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "transaction type not supported")
+}
 
 // ErrAlreadyRunning is returned by Indexer.Start if the indexer is already running.
 var ErrAlreadyRunning = errors.New("idx: indexer already running")
+
+// ErrIndexerStopped is returned by Indexer.Start once Stop has been called.
+// An Indexer is one-shot: Stop permanently closes its pool and dispatcher,
+// so there's nothing left for a subsequent Start to resume — build a new
+// Indexer (and Pool) instead of restarting this one.
+var ErrIndexerStopped = errors.New("idx: indexer already stopped")
 
 // ErrNoAvailableProvider is returned by ProviderPool RPC calls when no
 // provider in the pool can currently serve the request — every provider is

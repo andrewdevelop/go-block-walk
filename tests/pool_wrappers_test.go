@@ -16,7 +16,7 @@ import (
 // around the selected Provider once.
 func TestPool_RPCWrapperMethods(t *testing.T) {
 	client := newFakeEthClient()
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, client)}})
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, client)}})
 	defer pool.Close()
 	ctx := context.Background()
 
@@ -47,7 +47,7 @@ func TestPool_RPCWrapperMethods(t *testing.T) {
 }
 
 func TestPool_NoAvailableProviderErrorsOnEveryWrapper(t *testing.T) {
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{
 		{Name: "bad", Priority: 1, Dial: testDial(nil, errors.New("down")), Retry: RetryConfig{MaxAttempts: 1}},
 	}})
 	defer pool.Close()
@@ -84,7 +84,7 @@ func TestPool_NoAvailableProviderErrorsOnEveryWrapper(t *testing.T) {
 func TestPool_BlockByNumberDoesNotPenalizeLocalDecodeError(t *testing.T) {
 	client := newFakeEthClient()
 	client.setBlockByNumberErr(errors.New("transaction type not supported"))
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, client)}})
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, client)}})
 	defer pool.Close()
 
 	before := pool.GetScores()["a"]

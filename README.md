@@ -8,7 +8,7 @@ small `ChainStorage` interface.
 
 No concrete storage backend is bundled — implement `ChainStorage` against
 your own database (that alone is a complete Indexer backend — persisting
-provider health scores and quota usage is optional, see
+*and restoring* provider health scores and quota usage is optional, see
 [Custom storage backends](#custom-storage-backends)), or use the included
 in-memory `Memory` store for tests, demos, and local development.
 
@@ -21,32 +21,50 @@ import idx "github.com/andrewdevelop/go-block-walk"
 
 ## Features
 
-- **Provider pool** (`Pool`) — dials multiple RPC endpoints, ranks them by a
-  live health score, and automatically routes around unhealthy providers.
+- **Provider pool** (`Pool`) — dials multiple RPC endpoints, ranks them by
+  `Priority` (primary key) and a live health score (tiebreaker), and
+  automatically routes around unhealthy providers. `NewPool` validates its
+  config (at least one provider, unique non-empty names) and returns an
+  error instead of constructing a pool that can never work.
 - **Per-provider resilience** — token-bucket rate limiting, circuit
-  breaking ([sony/gobreaker](https://github.com/sony/gobreaker)), and
-  exponential backoff with jitter, all independently configurable.
+  breaking ([sony/gobreaker](https://github.com/sony/gobreaker), its
+  default failure filters cover 429/401/forbidden/5xx/timeout/
+  connection-refused patterns), exponential backoff with jitter and a 1ms
+  floor, and an optional per-attempt `RequestTimeout`, all independently
+  configurable.
 - **Quota tracking** — bounds requests and/or "compute unit" style credits
-  (e.g. Alchemy) per provider within a rolling period.
+  (e.g. Alchemy) per provider within a rolling period, charged per physical
+  RPC attempt (so retries against a metered provider are accounted for, not
+  just the first try).
 - **Indexer** (`Indexer`) — polls for new blocks on a timer or on demand
   (`Nudge`). Uses a low-latency, one-block-at-a-time sync path by default;
   set `PoolConfig.MaxLogBlockRange > 1` and it switches to a chunked
   `eth_getLogs` batch path instead — the same setting that bounds chunk
-  size also decides which path runs.
+  size also decides which path runs. A block's logs are only ever marked
+  processed once its header, logs and dispatch all succeed — a transient
+  RPC or listener error halts progress at that block instead of silently
+  skipping it, so the next tick retries it (at-least-once delivery; keep
+  listeners idempotent). Optional `ReorgDepth` also detects and rewinds a
+  same-height/shallow reorg, not just a full chain reset. Lifecycle is
+  one-shot and safe to tear down twice: `Stop` is idempotent, and `Start`
+  after `Stop` returns `ErrIndexerStopped` instead of silently doing
+  nothing.
 - **Pluggable, segregated storage** — `ChainStorage` (sync progress +
   indexed events) is the only thing you need to implement to back the
   indexer with your own database. `ScoreStorage` and `QuotaStorage` (health
   scores / quota bookkeeping) are separate, optional interfaces — the
-  Indexer detects them via a type assertion and simply skips persisting
-  that data if your storage doesn't implement them. `Memory` implements all
-  three.
+  Indexer detects them via a type assertion, restores whatever they have
+  persisted back onto the pool's providers at startup, and keeps persisting
+  as a side effect of syncing; if your storage doesn't implement them, that
+  data simply isn't tracked. `Memory` implements all three.
 - **Domain errors** — `ErrNoAvailableProvider`, `ErrRetriesExhausted`,
-  `ErrQuotaExceeded`, and `ErrProviderPoolExhausted` are exported sentinels
-  you can match with `errors.Is`, instead of parsing error strings.
+  `ErrQuotaExceeded`, `ErrProviderPoolExhausted`, `ErrAlreadyRunning` and
+  `ErrIndexerStopped` are exported sentinels you can match with
+  `errors.Is`, instead of parsing error strings.
 - **Everything is an interface** — `ProviderPool`, `RPCProvider`,
-  `ChainStorage`, `ScoreStorage`, `QuotaStorage`, `BlockchainListener`,
-  `BlockchainEventDispatcher` — so any piece can be swapped or faked
-  independently in your own tests.
+  `ChainStorage`, `ScoreStorage`, `QuotaStorage`, `QuotaRestorer`,
+  `BlockchainListener`, `BlockchainEventDispatcher` — so any piece can be
+  swapped or faked independently in your own tests.
 
 ## Install
 
@@ -80,7 +98,7 @@ func (myListener) HandleLog(l types.Log, blockTimestamp uint64) error {
 }
 
 func main() {
-	pool := idx.NewPool(idx.PoolConfig{
+	pool, err := idx.NewPool(idx.PoolConfig{
 		// How many blocks a single eth_getLogs call may span when the
 		// indexer batches a backfill, applied to every provider below.
 		// Defaults to 1 (no real batching) if left unset.
@@ -94,15 +112,20 @@ func main() {
 				CircuitBreaker: idx.CircuitBreakerConfig{
 					Enabled: true, Threshold: 5, Timeout: 30 * time.Second, HalfOpenMaxCalls: 1,
 				},
-				Retry: idx.RetryConfig{MaxAttempts: 3, BaseDelay: 200 * time.Millisecond, MaxDelay: 2 * time.Second, Jitter: true},
+				Retry:          idx.RetryConfig{MaxAttempts: 3, BaseDelay: 200 * time.Millisecond, MaxDelay: 2 * time.Second, Jitter: true},
+				RequestTimeout: 10 * time.Second,
 			},
 			{
-				Name:     "fallback",
-				URL:      "https://eth-mainnet.fallback.example.com",
-				Priority: 2,
+				Name:           "fallback",
+				URL:            "https://eth-mainnet.fallback.example.com",
+				Priority:       2,
+				RequestTimeout: 10 * time.Second,
 			},
 		},
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer pool.Close()
 
 	storage := idx.NewMemory() // swap for your own ChainStorage implementation in production
@@ -113,6 +136,10 @@ func main() {
 			Chain:         "ethereum",
 			StartBlock:    18_000_000,
 			BlockInterval: 5 * time.Second,
+			// Opt in to detecting a same-height/shallow reorg (not just a full chain reset): 
+			// keep the last 12 processed block hashes in memory and rewind/reprocess on a mismatch. 
+			// 0 (the default) disables this check.
+			ReorgDepth: 12,
 		},
 		pool, storage, dispatcher,
 		idx.WithLogger(slog.Default()),
@@ -143,44 +170,233 @@ func main() {
 
 ## Architecture
 
-```
-                 ┌─────────────┐
-   RPC calls     │   Provider   │  rate limit → circuit breaker → retry/backoff → quota
-  ┌─────────────▶│  (1 per URL) │
-  │              └─────────────┘
-  │                     ▲
-┌─────┐         health score ranking
-│ Pool│◀──────────────────┘
-└─────┘
-  ▲
-  │ ProviderPool interface
-  │
-┌────────┐   BlockchainEventDispatcher   ┌───────────────────┐
-│ Indexer│──────────────────────────────▶│  your listeners    │
-└────────┘                               └───────────────────┘
-  │
-  │ ChainStorage interface (+ optional ScoreStorage, QuotaStorage)
-  ▼
-┌──────────────┐
-│ Memory (impl)│  ← or your own Postgres/SQLite/... implementation
-└──────────────┘
+```mermaid
+flowchart TD
+    Indexer(["Indexer"])
+    Pool(["Pool"])
+    Provider["Provider (1 per URL)<br/>rate limit → circuit breaker →<br/>retry/backoff → timeout → quota"]
+    Listeners["your listeners"]
+    Storage[("Memory (impl)<br/>or your own Postgres/SQLite/...")]
+
+    Indexer -- "ProviderPool interface" --> Pool
+    Pool -- "RPC calls" --> Provider
+    Provider -- "health score ranking" --> Pool
+    Indexer -- "BlockchainEventDispatcher" --> Listeners
+    Indexer -- "ChainStorage interface<br/>(+ optional ScoreStorage, QuotaStorage)" --> Storage
 ```
 
 - **`Provider`** wraps a single JSON-RPC endpoint (via an `EthClient`
   interface — satisfied by `*ethclient.Client`, or a fake in tests) with a
-  rate limiter, circuit breaker, retry loop and quota manager.
-- **`Pool`** holds several `Provider`s, periodically re-ranks them by health
-  score (`PoolConfig.UpdateInterval`, default 30s), and always routes each
-  call to the best currently-available one. It also owns
+  rate limiter, circuit breaker, retry loop, optional per-attempt
+  `RequestTimeout`, and quota manager — in that order, per attempt. `Close`
+  is idempotent (safe to call more than once).
+- **`Pool`** holds several `Provider`s and periodically re-ranks them
+  (`PoolConfig.UpdateInterval`, default 30s): `Priority` (ascending — lower
+  number preferred) is always the primary sort key, exactly matching the
+  order at construction; health score only breaks ties between
+  same-priority providers. `GetProvider` then routes each call to the
+  first currently-available one in that order. `Pool` also owns
   `PoolConfig.MaxLogBlockRange` — one eth_getLogs chunk size applied
-  uniformly to every provider (default 1); there's no per-provider override.
+  uniformly to every provider (default 1); there's no per-provider
+  override. `NewPool` validates its config and returns `(*Pool, error)`;
+  `Close` is idempotent.
 - **`Indexer`** depends only on the `ProviderPool`, `ChainStorage` and
   `BlockchainEventDispatcher` interfaces — never on `Pool`/`Memory`
   directly — so you can inject fakes in your own tests exactly like this
-  module's own test suite does. It persists provider health scores and
-  quota usage too, but only if the `ChainStorage` you hand it also happens
-  to implement `ScoreStorage`/`QuotaStorage` (detected via a type
-  assertion) — neither is required.
+  module's own test suite does. If the `ChainStorage` you hand it also
+  implements `ScoreStorage`/`QuotaStorage` (detected via a type assertion),
+  it restores whatever they have persisted back onto the pool's providers
+  at construction, then keeps persisting both as a side effect of normal
+  syncing — neither storage capability is required. `Start`/`Stop` are
+  one-shot and idempotent: `Stop` can be called more than once safely, and
+  `Start` after a `Stop` returns `ErrIndexerStopped` rather than launching
+  a sync loop whose pool has already been torn down.
+
+## Configuration
+
+All config types live in [`config.go`](config.go). Every field is optional
+unless stated otherwise — zero values fall back to a documented default.
+
+### `ProviderConfig` — one upstream RPC endpoint
+
+Passed as `PoolConfig.Providers[i]`, one per URL.
+
+| Field            | Type                   | Default                             | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+|------------------|------------------------|-------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Name`           | `string`               | —                                   | **Required, must be unique** within the pool. `NewPool` rejects an empty or duplicate name.                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `URL`            | `string`               | —                                   | Dialed as-is unless `APIKey` is set, in which case the client dials `"<URL>/<APIKey>"`.                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `APIKey`         | `string`               | —                                   | Appended to `URL` (see above). Leave empty if your URL is already complete.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `Priority`       | `int`                  | `0`                                 | Lower number = preferred. Primary key for `Pool`'s ranking — see [`PoolConfig`](#poolconfig--the-provider-pool) below.                                                                                                                                                                                                                                                                                                                                                                                         |
+| `Dial`           | `DialFunc`             | go-ethereum `ethclient.DialContext` | Override the transport entirely — this is how tests inject a fake `EthClient` without a real endpoint.                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `RateLimit`      | `RateLimitConfig`      | disabled                            | Token-bucket limiter in front of every attempt.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `CircuitBreaker` | `CircuitBreakerConfig` | disabled                            | Trips on repeated failures; see below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `Retry`          | `RetryConfig`          | 1 attempt, no backoff               | Retry/backoff loop around each call.                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `Quota`          | `QuotaConfig`          | unlimited                           | Rolling request/credit budget.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `RequestTimeout` | `time.Duration`        | disabled (`0`)                      | Bounds a *single physical attempt* via `context.WithTimeout` — a short timeout doesn't starve later retries, since it's applied fresh per attempt, not once for the whole retry loop. Go-ethereum's `ethclient` has no built-in per-request timeout, so without this a stuck upstream (e.g. a dropped TCP packet with no RST) hangs the call until the caller's own context is cancelled — which may be never. **Not** applied to `SubscribeNewHead` (a long-lived subscription, not a request/response call). |
+
+A dial failure at construction doesn't fail `NewProvider`/`NewPool` — the
+provider is simply marked unavailable (`IsAvailable() == false`) and the
+pool routes around it, the same as a circuit-broken or quota-exhausted one.
+
+### `RateLimitConfig`
+
+| Field     | Type      | Default | Notes                                                          |
+|-----------|-----------|---------|----------------------------------------------------------------|
+| `Enabled` | `bool`    | `false` | If `false`, every other field is ignored — no limiting at all. |
+| `RPS`     | `float64` | —       | Sustained requests/second (`golang.org/x/time/rate.Limit`).    |
+| `Burst`   | `int`     | —       | Token-bucket burst size.                                       |
+
+### `CircuitBreakerConfig`
+
+Wraps [`sony/gobreaker`](https://github.com/sony/gobreaker).
+
+| Field              | Type            | Default | Notes                                                                                                                                  |
+|--------------------|-----------------|---------|----------------------------------------------------------------------------------------------------------------------------------------|
+| `Enabled`          | `bool`          | `false` | If `false`, calls always execute directly — `IsAvailable()` always reports `true`.                                                     |
+| `Threshold`        | `int`           | `0`     | Trips once `TotalFailures >= Threshold` **and** the failure ratio is `>= 50%` within the rolling window — both conditions, not either. |
+| `Timeout`          | `time.Duration` | `0`     | `gobreaker`'s open→half-open recovery timeout (and counting-window interval).                                                          |
+| `HalfOpenMaxCalls` | `int`           | `0`     | Trial calls allowed while half-open before deciding to close or re-open.                                                               |
+| `FilterErrors`     | `[]string`      | —       | Extra case-insensitive substrings that count as a *breaker-tripping* failure, added on top of the built-in set below.                  |
+
+An error only trips the breaker if it matches one of these substrings —
+anything else (e.g. an application-level "not found") is treated as a
+breaker *success* and never counts against `Threshold`, so it can't
+accidentally punish a provider for a caller error. The built-in set:
+
+```
+429, 401, unauthorized, rate limit, forbidden,
+context deadline, connection refused, timeout,
+500, 502, 503, 504,
+internal error, internal server error,
+service unavailable, bad gateway, gateway timeout
+```
+
+### `RetryConfig`
+
+| Field         | Type            | Default   | Notes                                                                                                                                                                                            |
+|---------------|-----------------|-----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `MaxAttempts` | `int`           | `1`       | Zero or negative is treated as `1` (a single attempt, no retry).                                                                                                                                 |
+| `BaseDelay`   | `time.Duration` | `0`       | Backoff after attempt *n* is `BaseDelay × 2^(n-1)`, floored at 1ms even if `BaseDelay` is `0` — a misconfigured-but-retrying provider still gets a pause between attempts instead of a hot loop. |
+| `MaxDelay`    | `time.Duration` | unbounded | Caps the exponential growth above.                                                                                                                                                               |
+| `Jitter`      | `bool`          | `false`   | Adds up to `+50%` random jitter on top of the computed delay.                                                                                                                                    |
+
+Only errors matching a *retryable* substring are retried at all —
+`429`, `rate limit`, `timeout`, `context deadline`, `connection refused`,
+`network`, `temporary` — with `401`/`unauthorized`/`forbidden` always
+winning as non-retryable even if a retryable substring also appears in the
+same message. Anything matching neither list is treated as non-retryable
+and returned immediately on the first attempt. This is deliberately
+coarse, substring-based classification (not typed JSON-RPC error codes,
+which go-ethereum's `ethclient` doesn't expose) — write error messages your
+upstreams actually return in mind if you rely on it.
+
+Once every attempt is exhausted, the returned error wraps both
+`ErrRetriesExhausted` and the last underlying error, so `errors.Is` works
+for either.
+
+### `QuotaConfig` / `CreditsConfig`
+
+| Field     | Type             | Default          | Notes                                                                                           |
+|-----------|------------------|------------------|-------------------------------------------------------------------------------------------------|
+| `Limit`   | `int64`          | `0` (unlimited)  | Max requests within `Period`.                                                                   |
+| `Period`  | `time.Duration`  | —                | Rolling window; resets `Limit`/`Credits` usage back to zero once it elapses.                    |
+| `Credits` | `*CreditsConfig` | `nil` (disabled) | Optional secondary "compute unit" style meter (e.g. Alchemy), checked *in addition to* `Limit`. |
+
+`CreditsConfig`: `Enabled bool`, `PerRequest int64` (credits charged per
+attempt), `Limit int64`, `Period time.Duration` (its own independent
+rolling window).
+
+Quota is consumed **per physical RPC attempt**, not once per logical call —
+a request retried 3 times under `RetryConfig.MaxAttempts: 3` is charged 3
+times if all 3 attempts actually go out over the wire, matching how a
+metered provider like Alchemy bills you. Once quota (or credits) for the
+current period is exhausted, further attempts fail fast with
+`ErrQuotaExceeded` without touching the rate limiter or circuit breaker,
+and the provider reports `IsAvailable() == false` until the period rolls
+over — checking availability never itself consumes quota.
+
+If your `ChainStorage` also implements `QuotaStorage`, usage is persisted
+as a side effect of syncing; if the provider additionally implements the
+`QuotaRestorer` interface (`*Provider` does), that persisted usage is
+restored at `NewIndexer` construction, so a restart doesn't forget how much
+of the current period was already spent. See [Custom storage
+backends](#custom-storage-backends).
+
+### `PoolConfig` — the provider pool
+
+| Field              | Type               | Default | Notes                                                                                                                                                                                                  |
+|--------------------|--------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Providers`        | `[]ProviderConfig` | —       | **Required, at least one.** `NewPool` returns an error for an empty list or a duplicate/empty `Name`.                                                                                                  |
+| `UpdateInterval`   | `time.Duration`    | `30s`   | How often `Pool` re-ranks providers by health score/quota penalty.                                                                                                                                     |
+| `MaxLogBlockRange` | `int`              | `1`     | eth_getLogs chunk size, applied uniformly to every provider — also what decides whether `Indexer` uses the sequential or batched sync path (`> 1` → batched). Zero or negative also falls back to `1`. |
+
+Ranking is **`Priority` ascending first, health score descending only to
+break ties** between providers that share the same `Priority` — a
+lower-priority-number provider is always preferred over a higher-numbered
+one as long as it's available (`IsAvailable()`), regardless of how their
+scores compare. `GetProvider()` returns the first available provider in
+that order.
+
+Health score itself starts at `Priority` and moves by `+0.1` per success
+(capped at `2×Priority`, or `1.0` if `Priority <= 0`) and `-0.2` per
+failure; it drops below `-1.0` marks the provider unhealthy until a
+success recovers it. `recalculateScores` additionally applies a penalty
+(`-10` at request-quota exhaustion, `-5` at credits exhaustion) on top of
+that score during each `UpdateInterval` tick — `RecordFailure` itself
+skips its own penalty for an `ErrQuotaExceeded` result, so quota
+exhaustion isn't double-penalized.
+
+### `IndexerConfig`
+
+| Field                              | Type            | Default        | Notes                                                                                                                                                                        |
+|------------------------------------|-----------------|----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Chain`                            | `string`        | —              | **Required.** An arbitrary identifier scoping all storage calls (`ChainStorage` methods take it as a parameter) — lets one `ChainStorage` back multiple chains.              |
+| `StartBlock`                       | `uint64`        | —              | Where a *fresh* (nothing persisted yet) sync begins. Ignored once anything has been persisted for `Chain`.                                                                   |
+| `BlockInterval`                    | `time.Duration` | —              | **Required, must be positive.** Polling tick interval; `Nudge()` triggers an out-of-band sync early and resets this ticker.                                                  |
+| `MaxConsecutiveProviderExhaustion` | `int`           | `5`            | Consecutive sync attempts with no available provider before `WithOnExhausted`'s callback fires. See [Handling provider pool exhaustion](#handling-provider-pool-exhaustion). |
+| `ProviderExhaustionRestartDelay`   | `time.Duration` | `15s`          | How long the sync loop waits before invoking the exhaustion callback once the threshold above is crossed.                                                                    |
+| `DebugMode`                        | `bool`          | `false`        | Re-processes from genesis every tick instead of resuming from the persisted last block, and never writes `SetLastBlock`. Local development only.                             |
+| `ReorgDepth`                       | `int`           | `0` (disabled) | Opts into detecting a reorg beyond a full chain reset. `0` preserves prior behaviour (only `currentBlock < lastBlock` is treated as a reorg — a full reset). See below.      |
+
+#### Reorg detection (`ReorgDepth`)
+
+With `ReorgDepth > 0`, the `Indexer` keeps the last `ReorgDepth` processed
+block hashes **in memory** (not persisted) and, each sync, re-verifies that
+the chain's current hash at `lastBlock` still matches what was recorded
+when that block was processed. A mismatch — same height, or a few blocks
+deep, not necessarily a full reset — means a reorg happened at or below
+`lastBlock`: the `Indexer` rewinds up to `ReorgDepth` blocks (never past
+`StartBlock`) and reprocesses them, relying on **idempotent listeners** to
+make the re-delivery safe (the same contract the rest of the sync loop
+already relies on for at-least-once delivery on any error).
+
+Because the tracked hashes are in-memory only, this protects a
+continuously running process but not a process that just restarted — a
+fresh `Indexer` has nothing to compare against until it has processed
+`ReorgDepth` more blocks after startup.
+
+### `NewIndexer` options
+
+Functional options, passed as the trailing arguments to `NewIndexer`:
+
+| Option                         | Notes                                                                                             |
+|--------------------------------|---------------------------------------------------------------------------------------------------|
+| `WithLogger(*slog.Logger)`     | Defaults to `slog.Default()`.                                                                     |
+| `WithOnExhausted(func(error))` | Defaults to a no-op. See [Handling provider pool exhaustion](#handling-provider-pool-exhaustion). |
+
+### Domain errors
+
+All exported sentinels (see [`errors.go`](errors.go)), matchable with
+`errors.Is`:
+
+| Error                      | Returned by                              | Meaning                                                                                          |
+|----------------------------|------------------------------------------|--------------------------------------------------------------------------------------------------|
+| `ErrNoAvailableProvider`   | `ProviderPool` RPC methods               | Every provider is unhealthy, circuit-broken, or quota-exhausted right now.                       |
+| `ErrQuotaExceeded`         | `Provider`/`Pool` RPC methods            | This attempt would exceed the provider's request or credit quota; not retried.                   |
+| `ErrRetriesExhausted`      | `WithRetry` / `Provider` RPC methods     | Every configured attempt failed on a retryable error; wraps the last underlying error too.       |
+| `ErrProviderPoolExhausted` | Passed into `WithOnExhausted`'s callback | No provider has been available for `MaxConsecutiveProviderExhaustion` consecutive sync attempts. |
+| `ErrAlreadyRunning`        | `Indexer.Start`                          | The indexer is already running.                                                                  |
+| `ErrIndexerStopped`        | `Indexer.Start`                          | `Stop` was already called; an `Indexer` is one-shot — build a new one instead of restarting.     |
 
 ## Handling provider pool exhaustion
 
@@ -248,11 +464,36 @@ type Storage interface {
 ```
 
 `NewIndexer` takes a `ChainStorage`; at construction it type-asserts that
-value against `ScoreStorage` and `QuotaStorage` and persists whichever it
-finds. A store backing only `ChainStorage` — no score/quota tracking at
-all — is a complete, valid Indexer backend (see
+value against `ScoreStorage` and `QuotaStorage`, and if either is present:
+
+1. **Restores** whatever was previously persisted back onto the pool's
+   providers right away — `RPCProvider.SetScore` for health score, and (if
+   the concrete provider additionally implements `QuotaRestorer`, which
+   `*Provider` does) `RestoreQuotaUsage` for request-quota usage. This is
+   what makes a restart not forget a provider was unhealthy or had already
+   spent part of its quota this period. Nothing persisted yet for a
+   provider just leaves it at its construction-time defaults.
+2. **Persists** both, going forward, as a side effect of normal syncing.
+
+A store backing only `ChainStorage` — no score/quota tracking at all — is
+a complete, valid Indexer backend (see
 `tests/storage_segregation_test.go`'s `chainOnlyStorage` for a minimal
 example). `Pool.PersistQuotaUsage` likewise only asks for `QuotaStorage`.
+
+```go
+// QuotaRestorer is implemented by an RPCProvider that can have persisted
+// quota usage applied back to it — checked via type assertion, same
+// optional-capability pattern as ScoreStorage/QuotaStorage themselves.
+// *Provider implements it; a fake RPCProvider in your own tests doesn't
+// need to.
+type QuotaRestorer interface {
+	RestoreQuotaUsage(used int64, resetAt time.Time)
+}
+```
+
+Only request-quota usage round-trips this way — credits (the optional
+secondary "compute unit" meter, see `CreditsConfig`) aren't persisted, so
+they aren't restored either.
 
 `Memory` mirrors this split internally rather than being one 200-line type:
 it's a thin composition of three independent, independently testable
@@ -296,8 +537,8 @@ tripping its circuit breaker until the pool is exhausted and
 `ErrProviderPoolExhausted` fires through `WithOnExhausted`.
 
 ```sh
-go test ./...                                   # run everything
-go test ./... -race                             # with the race detector
+go test ./...                                    # run everything
+go test ./... -race                              # with the race detector
 go test ./tests/... -coverpkg=./... -cover       # coverage of the idx package itself
 go test ./tests/... -run TestIntegration -v      # just the end-to-end pipeline test
 ```

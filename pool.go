@@ -2,10 +2,10 @@ package idx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,11 +36,27 @@ type Pool struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
+	closeOnce        sync.Once
 }
 
 // NewPool dials every configured provider and starts a background loop that
 // periodically re-ranks them by health score. Call Close when done.
-func NewPool(cfg PoolConfig) *Pool {
+func NewPool(cfg PoolConfig) (*Pool, error) {
+	if len(cfg.Providers) == 0 {
+		return nil, fmt.Errorf("idx: pool requires at least one provider")
+	}
+
+	seenNames := make(map[string]bool, len(cfg.Providers))
+	for _, pc := range cfg.Providers {
+		if pc.Name == "" {
+			return nil, fmt.Errorf("idx: provider name is required")
+		}
+		if seenNames[pc.Name] {
+			return nil, fmt.Errorf("idx: duplicate provider name %q", pc.Name)
+		}
+		seenNames[pc.Name] = true
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	updateInterval := cfg.UpdateInterval
@@ -69,14 +85,12 @@ func NewPool(cfg PoolConfig) *Pool {
 		pool.orderedList = append(pool.orderedList, p)
 	}
 
-	sort.Slice(pool.orderedList, func(i, j int) bool {
-		return pool.orderedList[i].Priority() < pool.orderedList[j].Priority()
-	})
+	pool.sortOrderedListLocked()
 
 	pool.wg.Add(1)
 	go pool.updateLoop()
 
-	return pool
+	return pool, nil
 }
 
 func (pool *Pool) updateLoop() {
@@ -112,8 +126,24 @@ func (pool *Pool) recalculateScores() {
 		pool.penalties[p.Name()] = penalty
 	}
 
+	pool.sortOrderedListLocked()
+}
+
+// sortOrderedListLocked requires pool.mu to be held. Priority (ascending —
+// lower number preferred) is the primary key, exactly matching NewPool's
+// initial ordering; adjustedScore (descending — higher is healthier) only
+// breaks ties between same-priority providers. Sorting by adjustedScore
+// alone would let it override Priority entirely, since baseScore is seeded
+// from the raw Priority number and dominates the small +0.1/-0.2 deltas
+// RecordSuccess/RecordFailure apply — that was the bug: a low-priority
+// (large-number) provider's raw score outweighs a high-priority one's.
+func (pool *Pool) sortOrderedListLocked() {
 	sort.Slice(pool.orderedList, func(i, j int) bool {
-		return pool.adjustedScoreLocked(pool.orderedList[i]) > pool.adjustedScoreLocked(pool.orderedList[j])
+		a, b := pool.orderedList[i], pool.orderedList[j]
+		if a.Priority() != b.Priority() {
+			return a.Priority() < b.Priority()
+		}
+		return pool.adjustedScoreLocked(a) > pool.adjustedScoreLocked(b)
 	})
 }
 
@@ -154,20 +184,22 @@ func (pool *Pool) RecordSuccess(provider RPCProvider) {
 	}
 }
 
+// RecordFailure lowers provider's health score for err — except when err is
+// ErrQuotaExceeded: recalculateScores already applies its own penalty for
+// quota exhaustion (the `used >= limit` check), so applying RecordFailure's
+// score penalty here too would double-penalize the exact same condition on
+// every quota-denied call.
 func (pool *Pool) RecordFailure(provider RPCProvider, err error) {
+	if errors.Is(err, ErrQuotaExceeded) {
+		return
+	}
+
 	pool.mu.RLock()
 	p, ok := pool.providers[provider.Name()]
 	pool.mu.RUnlock()
 	if ok {
 		p.RecordFailure(err)
 	}
-}
-
-// isLocalDecodeError reports whether err is caused by go-ethereum being
-// unable to decode a transaction type locally, rather than a provider-side
-// failure. These errors should not penalize the provider's health score.
-func isLocalDecodeError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "transaction type not supported")
 }
 
 func (pool *Pool) BlockByNumber(ctx context.Context, blockNum uint64) (*types.Block, error) {
@@ -343,15 +375,18 @@ func (pool *Pool) CodeAt(ctx context.Context, address common.Address) ([]byte, e
 	return p.CodeAt(ctx, address)
 }
 
+// Close is safe to call more than once; only the first call has any effect.
 func (pool *Pool) Close() {
-	pool.cancel()
-	pool.wg.Wait()
+	pool.closeOnce.Do(func() {
+		pool.cancel()
+		pool.wg.Wait()
 
-	pool.mu.RLock()
-	defer pool.mu.RUnlock()
-	for _, p := range pool.providers {
-		p.Close()
-	}
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+		for _, p := range pool.providers {
+			p.Close()
+		}
+	})
 }
 
 func (pool *Pool) GetScores() map[string]float64 {

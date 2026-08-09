@@ -85,7 +85,7 @@ func hardhatCall(t *testing.T, method string, params []any) json.RawMessage {
 func requireHardhat(t *testing.T) ProviderPool {
 	t.Helper()
 
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{{
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{{
 		Name:     "hardhat",
 		URL:      hardhatRPCURL(),
 		Priority: 1,

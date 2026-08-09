@@ -151,7 +151,7 @@ var _ QuotaStorage = (*quotaOnlyStore)(nil)
 
 func TestPool_PersistQuotaUsageAcceptsQuotaOnlyStorage(t *testing.T) {
 	client := newFakeEthClient()
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{poolProviderConfig("p1", 1, client)}})
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("p1", 1, client)}})
 	defer pool.Close()
 
 	qs := newQuotaOnlyStore()

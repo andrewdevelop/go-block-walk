@@ -162,6 +162,16 @@ func (p *fakePool) setHeaderErr(err error) {
 	p.headerErr = err
 }
 
+// setHeader pins the header returned for a given block number — used to
+// simulate a reorg by changing what HeaderByNumber returns for an
+// already-processed height (a different header, thus a different hash,
+// while the block number itself stays the same).
+func (p *fakePool) setHeader(number uint64, h *types.Header) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.headers[number] = h
+}
+
 func (p *fakePool) addLog(blockNum uint64, l types.Log) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -536,5 +546,31 @@ func TestIndexer_StopIsIdempotentSafe(t *testing.T) {
 	idx.Stop()
 	if idx.IsRunning() {
 		t.Fatal("expected IsRunning() == false after Stop")
+	}
+
+	// Calling Stop again must not panic or re-run teardown (double
+	// dispatcher.Close()/pool.Close()).
+	idx.Stop()
+}
+
+// TestIndexer_StartAfterStopReturnsErrIndexerStopped proves the fix for a
+// previously silent lifecycle bug: Stop cancels the Indexer's internal
+// context for good, so a subsequent Start used to return nil and launch a
+// sync loop whose very first select on ctx.Done() would fire immediately,
+// silently doing nothing forever. Start must now reject it explicitly.
+func TestIndexer_StartAfterStopReturnsErrIndexerStopped(t *testing.T) {
+	pool := newFakePool()
+	idx := newTestIndexer(t, IndexerConfig{}, pool, NewMemory(), NewEventDispatcher(nil))
+
+	if err := idx.Start(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	idx.Stop()
+
+	if err := idx.Start(); !errors.Is(err, ErrIndexerStopped) {
+		t.Fatalf("expected ErrIndexerStopped, got %v", err)
+	}
+	if idx.IsRunning() {
+		t.Fatal("expected IsRunning() == false: Start after Stop must not launch the sync loop")
 	}
 }
