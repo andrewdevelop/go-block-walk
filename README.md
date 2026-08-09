@@ -227,10 +227,22 @@ they test, so keeping test files in their own directory means testing
 through the public surface only, the same way any consumer of this module
 would.
 
+Most files are focused unit tests (one component at a time). One test,
+[`tests/integration_test.go`](tests/integration_test.go)'s
+`TestIntegration_FullPipeline`, wires up a real `Pool` + `Provider` +
+`Memory` + `Indexer` + `EventDispatcher` together (only the JSON-RPC
+transport is faked) and drives the whole thing through a realistic
+lifecycle in one run: failover past a dead provider, transient errors
+recovered by retry, a burst of blocks forcing the chunked batch path,
+health-score/quota persistence, and finally a permanently broken provider
+tripping its circuit breaker until the pool is exhausted and
+`ErrProviderPoolExhausted` fires through `WithOnExhausted`.
+
 ```sh
 go test ./...                                   # run everything
 go test ./... -race                             # with the race detector
 go test ./tests/... -coverpkg=./... -cover       # coverage of the idx package itself
+go test ./tests/... -run TestIntegration -v      # just the end-to-end pipeline test
 ```
 
 ## Project layout
