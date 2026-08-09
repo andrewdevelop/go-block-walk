@@ -19,6 +19,13 @@ type CircuitBreaker struct {
 var defaultBreakerFilters = []string{
 	"429", "401", "unauthorized", "rate limit", "forbidden",
 	"context deadline", "connection refused", "timeout",
+	// 5xx / server-side failures: without these, IsSuccessful treats them as
+	// "not a filtered failure" and gobreaker never counts them, so a
+	// provider returning nothing but 500s burns retries forever without
+	// ever tripping the breaker or losing health score.
+	"500", "502", "503", "504",
+	"internal error", "internal server error",
+	"service unavailable", "bad gateway", "gateway timeout",
 }
 
 func NewCircuitBreaker(cfg CircuitBreakerConfig) *CircuitBreaker {

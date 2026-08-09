@@ -81,6 +81,39 @@ func TestCircuitBreaker_SuccessDoesNotTrip(t *testing.T) {
 	}
 }
 
+// TestCircuitBreaker_TripsOn5xxAndInternalErrors proves the fix for a
+// previously silent gap: IsSuccessful treats any error not matching the
+// filter set as a breaker "success", so before this fix a provider
+// returning nothing but 500s / "internal error" never tripped the breaker
+// and never lost health score — it just burned retries forever.
+func TestCircuitBreaker_TripsOn5xxAndInternalErrors(t *testing.T) {
+	cases := []string{
+		"500 internal server error",
+		"502 bad gateway",
+		"503 service unavailable",
+		"504 gateway timeout",
+	}
+
+	for _, errMsg := range cases {
+		t.Run(errMsg, func(t *testing.T) {
+			cb := NewCircuitBreaker(CircuitBreakerConfig{
+				Enabled:          true,
+				Threshold:        3,
+				Timeout:          time.Minute,
+				HalfOpenMaxCalls: 1,
+			})
+
+			for i := 0; i < 3; i++ {
+				_ = cb.Execute(func() error { return errors.New(errMsg) })
+			}
+
+			if cb.IsAvailable() {
+				t.Fatalf("expected breaker to trip on repeated %q", errMsg)
+			}
+		})
+	}
+}
+
 func TestCircuitBreaker_CustomFilterErrors(t *testing.T) {
 	cb := NewCircuitBreaker(CircuitBreakerConfig{
 		Enabled:          true,

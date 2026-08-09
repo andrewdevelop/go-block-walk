@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 const (
@@ -38,14 +39,22 @@ type Indexer struct {
 
 	mu        sync.RWMutex
 	isRunning bool
+	stopped   bool
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+	stopOnce  sync.Once
 
 	exhaustion  *ExhaustionTracker
 	onExhausted func(error)
 
 	nudge *NudgeSignal
+
+	// reorgDepth and the hash bookkeeping below are only ever touched from
+	// syncLoop's single goroutine, so they need no lock of their own.
+	reorgDepth   int
+	recentHashes map[uint64]common.Hash
+	hashOrder    []uint64
 }
 
 // Option configures optional Indexer behaviour.
@@ -129,23 +138,74 @@ func NewIndexer(cfg IndexerConfig, pool ProviderPool, storage ChainStorage, disp
 		exhaustion:  NewExhaustionTracker(cfg.MaxConsecutiveProviderExhaustion),
 		onExhausted: func(error) {},
 		nudge:       NewNudgeSignal(),
+
+		reorgDepth:   cfg.ReorgDepth,
+		recentHashes: make(map[uint64]common.Hash),
 	}
 
 	for _, opt := range opts {
 		opt(idx)
 	}
 
+	idx.restoreProviderState()
+
 	return idx, nil
 }
 
+// restoreProviderState loads previously persisted provider health scores
+// and quota usage (if storage implements ScoreStorage/QuotaStorage) back
+// onto the pool's providers, so a restart doesn't make a broken provider
+// look healthy again or forget quota already spent this period. Missing
+// entries (nothing persisted yet for a provider) are left at their
+// construction-time defaults.
+func (idx *Indexer) restoreProviderState() {
+	if idx.scores == nil && idx.quotas == nil {
+		return
+	}
+
+	for _, p := range idx.pool.GetAllProviders() {
+		if p == nil {
+			// A ProviderPool implementation is free to return a nil entry
+			// for "no provider available right now" (e.g. this package's
+			// own test fakes do) — nothing to restore onto.
+			continue
+		}
+
+		if idx.scores != nil {
+			if s, err := idx.scores.GetProviderScore(idx.ctx, p.Name()); err != nil {
+				idx.logger.Warn("failed to restore provider score", "provider", p.Name(), "error", err)
+			} else if s != nil {
+				p.SetScore(s.Score)
+			}
+		}
+
+		if idx.quotas != nil {
+			if restorer, ok := p.(QuotaRestorer); ok {
+				if u, err := idx.quotas.GetQuotaUsage(idx.ctx, p.Name(), "requests"); err != nil {
+					idx.logger.Warn("failed to restore provider quota usage", "provider", p.Name(), "error", err)
+				} else if u != nil {
+					restorer.RestoreQuotaUsage(int64(u.Used), u.ResetAt)
+				}
+			}
+		}
+	}
+}
+
+// Start launches the sync loop. An Indexer is one-shot: once Stop has been
+// called, Start returns ErrIndexerStopped instead of silently launching a
+// sync loop whose context is already cancelled (Stop tears down the pool
+// and dispatcher for good — there's nothing left to resume).
 func (idx *Indexer) Start() error {
 	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if idx.stopped {
+		return ErrIndexerStopped
+	}
 	if idx.isRunning {
-		idx.mu.Unlock()
 		return ErrAlreadyRunning
 	}
 	idx.isRunning = true
-	idx.mu.Unlock()
 
 	idx.wg.Add(1)
 	go idx.syncLoop()
@@ -155,17 +215,21 @@ func (idx *Indexer) Start() error {
 
 // Stop cancels the sync loop, waits for it to exit, and closes the
 // dispatcher and pool (but not the storage — callers that share it with
-// other components close it themselves).
+// other components close it themselves). Safe to call more than once or
+// without a prior Start; only the first call has any effect.
 func (idx *Indexer) Stop() {
-	idx.cancel()
-	idx.wg.Wait()
+	idx.stopOnce.Do(func() {
+		idx.cancel()
+		idx.wg.Wait()
 
-	idx.mu.Lock()
-	idx.isRunning = false
-	idx.mu.Unlock()
+		idx.mu.Lock()
+		idx.isRunning = false
+		idx.stopped = true
+		idx.mu.Unlock()
 
-	idx.dispatcher.Close()
-	idx.pool.Close()
+		idx.dispatcher.Close()
+		idx.pool.Close()
+	})
 }
 
 // Nudge requests an immediate sync instead of waiting for the next
@@ -229,6 +293,11 @@ func (idx *Indexer) syncBlocks() error {
 		lastBlock = idx.config.StartBlock - 1
 	}
 
+	lastBlock, err = idx.detectReorgRewind(lastBlock)
+	if err != nil {
+		return fmt.Errorf("reorg check failed: %w", err)
+	}
+
 	currentBlock, err := idx.pool.BlockNumber(idx.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get latest block: %w", err)
@@ -244,6 +313,7 @@ func (idx *Indexer) syncBlocks() error {
 		if err := idx.storeLastBlock(lastBlock); err != nil {
 			return fmt.Errorf("failed to reset last block after chain reset: %w", err)
 		}
+		idx.pruneHashesAbove(lastBlock)
 	}
 
 	if currentBlock <= lastBlock {
@@ -272,8 +342,8 @@ func (idx *Indexer) syncBlocks() error {
 func (idx *Indexer) syncBlocksSequential(startBlock, currentBlock uint64) error {
 	for blockNum := startBlock; blockNum <= currentBlock; blockNum++ {
 		if err := idx.processBlock(blockNum); err != nil {
-			if isUnsupportedTxType(err) {
-				idx.logger.Warn("skipping block: unsupported transaction type (chain upgrade ahead of go-ethereum)", "block", blockNum)
+			if isLocalDecodeError(err) {
+				idx.logger.Warn("skipping block permanently: unsupported transaction type (chain upgrade ahead of go-ethereum); its logs will not be indexed", "block", blockNum)
 			} else {
 				return fmt.Errorf("failed to process block %d: %w", blockNum, err)
 			}
@@ -320,8 +390,8 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 			if !ok {
 				header, err := idx.pool.HeaderByNumber(idx.ctx, new(big.Int).SetUint64(l.BlockNumber))
 				if err != nil {
-					if isUnsupportedTxType(err) {
-						idx.logger.Warn("skipping block: unsupported transaction type (chain upgrade ahead of go-ethereum)", "block", l.BlockNumber)
+					if isLocalDecodeError(err) {
+						idx.logger.Warn("skipping block permanently: unsupported transaction type (chain upgrade ahead of go-ethereum); its logs will not be indexed", "block", l.BlockNumber)
 					} else {
 						return fmt.Errorf("failed to get header for block %d: %w", l.BlockNumber, err)
 					}
@@ -338,7 +408,13 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 			}
 
 			if err := idx.dispatcher.Dispatch(l, blockTime); err != nil {
-				idx.logger.Error("error dispatching log", "error", err)
+				return fmt.Errorf("failed to dispatch log for block %d: %w", l.BlockNumber, err)
+			}
+		}
+
+		if idx.reorgDepth > 0 {
+			if header, err := idx.pool.HeaderByNumber(idx.ctx, new(big.Int).SetUint64(chunkEnd)); err == nil {
+				idx.recordBlockHash(chunkEnd, header.Hash())
 			}
 		}
 
@@ -398,24 +474,103 @@ func (idx *Indexer) processBlock(blockNum uint64) error {
 		return fmt.Errorf("failed to get header for block %d: %w", blockNum, err)
 	}
 	blockTime := header.Time
+	idx.recordBlockHash(blockNum, header.Hash())
 
 	logs, err := idx.pool.LogsByBlockNumber(idx.ctx, blockNum)
 	if err != nil {
-		idx.logger.Error("LogsByBlockNumber error", "block", blockNum, "error", err)
-		return nil
+		return fmt.Errorf("failed to get logs for block %d: %w", blockNum, err)
 	}
 
 	for _, l := range logs {
 		if err := idx.dispatcher.Dispatch(l, blockTime); err != nil {
-			idx.logger.Error("error dispatching log", "error", err)
+			return fmt.Errorf("failed to dispatch log for block %d: %w", blockNum, err)
 		}
 	}
 
 	return nil
 }
 
-func isUnsupportedTxType(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "transaction type not supported")
+// recordBlockHash remembers blockNum's hash for later reorg comparison,
+// trimming to the last ReorgDepth entries. No-op if reorg detection is
+// disabled (ReorgDepth <= 0).
+func (idx *Indexer) recordBlockHash(blockNum uint64, hash common.Hash) {
+	if idx.reorgDepth <= 0 {
+		return
+	}
+
+	if _, exists := idx.recentHashes[blockNum]; !exists {
+		idx.hashOrder = append(idx.hashOrder, blockNum)
+	}
+	idx.recentHashes[blockNum] = hash
+
+	for len(idx.hashOrder) > idx.reorgDepth {
+		delete(idx.recentHashes, idx.hashOrder[0])
+		idx.hashOrder = idx.hashOrder[1:]
+	}
+}
+
+// pruneHashesAbove discards any recorded hash above blockNum, e.g. after a
+// rewind — those blocks are about to be reprocessed and will re-record
+// fresh hashes.
+func (idx *Indexer) pruneHashesAbove(blockNum uint64) {
+	kept := idx.hashOrder[:0]
+	for _, b := range idx.hashOrder {
+		if b > blockNum {
+			delete(idx.recentHashes, b)
+			continue
+		}
+		kept = append(kept, b)
+	}
+	idx.hashOrder = kept
+}
+
+// detectReorgRewind compares the chain's current hash at lastBlock against
+// the hash recorded when that block was processed. A mismatch means a
+// reorg happened at or below lastBlock — same height or a few blocks deep,
+// not necessarily a full reset (see the currentBlock < lastBlock check in
+// syncBlocks, which only catches the latter). When detected, it rewinds up
+// to ReorgDepth blocks (bounded by StartBlock) and persists the rewound
+// position so the caller reprocesses from there, relying on idempotent
+// listeners to make the re-delivery safe.
+//
+// No-op (returns lastBlock unchanged) if reorg detection is disabled, on a
+// fresh start (lastBlock == 0), or if lastBlock's hash was never recorded
+// (e.g. right after enabling ReorgDepth, or the block predates what's kept
+// in memory).
+func (idx *Indexer) detectReorgRewind(lastBlock uint64) (uint64, error) {
+	if idx.reorgDepth <= 0 || lastBlock == 0 {
+		return lastBlock, nil
+	}
+
+	wantHash, tracked := idx.recentHashes[lastBlock]
+	if !tracked {
+		return lastBlock, nil
+	}
+
+	header, err := idx.pool.HeaderByNumber(idx.ctx, new(big.Int).SetUint64(lastBlock))
+	if err != nil {
+		return lastBlock, fmt.Errorf("failed to verify chain tip for reorg check: %w", err)
+	}
+	if header.Hash() == wantHash {
+		return lastBlock, nil
+	}
+
+	rewindTo := idx.config.StartBlock
+	if uint64(idx.reorgDepth) < lastBlock {
+		if candidate := lastBlock - uint64(idx.reorgDepth); candidate > rewindTo {
+			rewindTo = candidate
+		}
+	}
+
+	idx.logger.Warn("reorg detected: chain hash at last processed block no longer matches what was indexed, rewinding",
+		"lastBlock", lastBlock, "rewindTo", rewindTo)
+
+	if err := idx.storeLastBlock(rewindTo); err != nil {
+		return lastBlock, fmt.Errorf("failed to persist rewound last block after reorg: %w", err)
+	}
+	idx.pruneHashesAbove(rewindTo)
+
+	return rewindTo, nil
 }
 
 func (idx *Indexer) GetLastBlock() (uint64, error) {

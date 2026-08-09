@@ -3,6 +3,7 @@ package idx_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,9 +23,22 @@ func poolProviderConfig(name string, priority int, client *fakeEthClient) Provid
 	}
 }
 
+// mustNewPool wraps NewPool for tests that expect construction to succeed —
+// most of the suite — so they don't each repeat the same error check.
+// Tests exercising NewPool's own validation (empty/duplicate providers)
+// call NewPool directly instead.
+func mustNewPool(t *testing.T, cfg PoolConfig) *Pool {
+	t.Helper()
+	pool, err := NewPool(cfg)
+	if err != nil {
+		t.Fatalf("NewPool failed: %v", err)
+	}
+	return pool
+}
+
 func TestPool_GetProviderPicksHighestPriorityFirst(t *testing.T) {
 	c1, c2 := newFakeEthClient(), newFakeEthClient()
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{
 		poolProviderConfig("low", 10, c1),
 		poolProviderConfig("high", 1, c2),
 	}})
@@ -43,7 +57,7 @@ func TestPool_SkipsUnavailableProviders(t *testing.T) {
 	goodClient := newFakeEthClient()
 	goodClient.setBlockNumber(99)
 
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{
 		{Name: "bad", Priority: 1, Dial: testDial(nil, errors.New("dial error")), Retry: RetryConfig{MaxAttempts: 1}},
 		poolProviderConfig("good", 2, goodClient),
 	}})
@@ -59,7 +73,7 @@ func TestPool_SkipsUnavailableProviders(t *testing.T) {
 }
 
 func TestPool_NoAvailableProviderReturnsError(t *testing.T) {
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{
 		{Name: "bad", Priority: 1, Dial: testDial(nil, errors.New("dial error")), Retry: RetryConfig{MaxAttempts: 1}},
 	}})
 	defer pool.Close()
@@ -78,7 +92,7 @@ func TestPool_FailureFallsBackToNextProvider(t *testing.T) {
 	working := newFakeEthClient()
 	working.setBlockNumber(7)
 
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{
 		poolProviderConfig("failing", 1, failing),
 		poolProviderConfig("working", 2, working),
 	}})
@@ -103,7 +117,7 @@ func TestPool_FailureFallsBackToNextProvider(t *testing.T) {
 
 func TestPool_RecordSuccessAndFailureRouteToNamedProvider(t *testing.T) {
 	client := newFakeEthClient()
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{poolProviderConfig("p1", 1, client)}})
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("p1", 1, client)}})
 	defer pool.Close()
 
 	p := pool.GetProvider()
@@ -122,7 +136,7 @@ func TestPool_RecordSuccessAndFailureRouteToNamedProvider(t *testing.T) {
 }
 
 func TestPool_MaxLogBlockRangeDefaultsToOne(t *testing.T) {
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, newFakeEthClient())}})
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, newFakeEthClient())}})
 	defer pool.Close()
 
 	if got := pool.MaxLogBlockRange(); got != DefaultMaxLogBlockRange {
@@ -131,7 +145,7 @@ func TestPool_MaxLogBlockRangeDefaultsToOne(t *testing.T) {
 }
 
 func TestPool_MaxLogBlockRangeAppliesGloballyToAllProviders(t *testing.T) {
-	pool := NewPool(PoolConfig{
+	pool := mustNewPool(t, PoolConfig{
 		MaxLogBlockRange: 777,
 		Providers: []ProviderConfig{
 			poolProviderConfig("a", 1, newFakeEthClient()),
@@ -151,7 +165,7 @@ func TestPool_MaxLogBlockRangeAppliesGloballyToAllProviders(t *testing.T) {
 func TestPool_LogsByBlockNumberAndRange(t *testing.T) {
 	client := newFakeEthClient()
 	client.setLogs([]types.Log{{BlockNumber: 5}})
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, client)}})
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, client)}})
 	defer pool.Close()
 
 	logs, err := pool.LogsByBlockNumber(context.Background(), 5)
@@ -173,7 +187,7 @@ func TestPool_LogsByBlockNumberAndRange(t *testing.T) {
 
 func TestPool_PersistQuotaUsage(t *testing.T) {
 	client := newFakeEthClient()
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{poolProviderConfig("p1", 1, client)}})
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("p1", 1, client)}})
 	defer pool.Close()
 
 	store := NewMemory()
@@ -191,7 +205,7 @@ func TestPool_PersistQuotaUsage(t *testing.T) {
 }
 
 func TestPool_GetScoresReturnsAllProviders(t *testing.T) {
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{
 		poolProviderConfig("a", 1, newFakeEthClient()),
 		poolProviderConfig("b", 2, newFakeEthClient()),
 	}})
@@ -211,7 +225,7 @@ func TestPool_GetScoresReturnsAllProviders(t *testing.T) {
 
 func TestPool_RecalculateScoresAppliesQuotaPenalty(t *testing.T) {
 	client := newFakeEthClient()
-	pool := NewPool(PoolConfig{
+	pool := mustNewPool(t, PoolConfig{
 		Providers: []ProviderConfig{{
 			Name:     "p1",
 			Priority: 1,
@@ -241,9 +255,66 @@ func TestPool_RecalculateScoresAppliesQuotaPenalty(t *testing.T) {
 	t.Fatalf("expected quota exhaustion to eventually apply a penalty lowering the score below the base priority, got %v", pool.GetScores()["p1"])
 }
 
+// TestNewPool_RejectsEmptyProviderList and TestNewPool_RejectsDuplicateNames
+// prove the fix for a previously silent misconfiguration: an empty (or
+// name-colliding) PoolConfig used to construct a Pool anyway — one that
+// either always returns ErrNoAvailableProvider forever, or silently
+// overwrites one provider's map entry with another's while leaving both in
+// the ranking list. NewPool must now reject both at construction.
+func TestNewPool_RejectsEmptyProviderList(t *testing.T) {
+	if _, err := NewPool(PoolConfig{}); err == nil {
+		t.Fatal("expected an error for a pool with no providers")
+	}
+}
+
+func TestNewPool_RejectsDuplicateNames(t *testing.T) {
+	if _, err := NewPool(PoolConfig{Providers: []ProviderConfig{
+		poolProviderConfig("dup", 1, newFakeEthClient()),
+		poolProviderConfig("dup", 2, newFakeEthClient()),
+	}}); err == nil {
+		t.Fatal("expected an error for duplicate provider names")
+	}
+}
+
+func TestNewPool_RejectsEmptyProviderName(t *testing.T) {
+	if _, err := NewPool(PoolConfig{Providers: []ProviderConfig{
+		poolProviderConfig("", 1, newFakeEthClient()),
+	}}); err == nil {
+		t.Fatal("expected an error for an empty provider name")
+	}
+}
+
+// TestPool_QuotaExceededDoesNotDoublePenalize proves the fix for a
+// previously silent bug: an ErrQuotaExceeded result used to still go
+// through RecordFailure (-0.2 immediately), on top of the separate -10
+// penalty recalculateScores applies for the same `used >= limit` condition
+// — double-penalizing one cause. RecordFailure is exercised directly (as
+// TestPool_RecordSuccessAndFailureRouteToNamedProvider already does above)
+// rather than through pool.BlockNumber, since quota exhaustion also makes
+// the provider fail Pool's own IsAvailable() gate — a quota-exceeded error
+// only reaches RecordFailure in the narrow race between that check and the
+// actual Consume(), which isn't reliably reproducible single-threaded.
+func TestPool_QuotaExceededDoesNotDoublePenalize(t *testing.T) {
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("p1", 1, newFakeEthClient())}})
+	defer pool.Close()
+
+	p := pool.GetProvider()
+	before := p.Score()
+
+	pool.RecordFailure(p, fmt.Errorf("provider p1: %w", ErrQuotaExceeded))
+	if got := p.Score(); got != before {
+		t.Fatalf("expected RecordFailure to skip its penalty for ErrQuotaExceeded (recalculateScores penalizes quota exhaustion separately), before=%v after=%v", before, got)
+	}
+
+	pool.RecordFailure(p, errors.New("boom"))
+	if got := p.Score(); got >= before {
+		t.Fatal("expected RecordFailure to still penalize a normal (non-quota) error")
+	}
+}
+
 func TestPool_CloseClosesAllProviders(t *testing.T) {
 	c1, c2 := newFakeEthClient(), newFakeEthClient()
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{
 		poolProviderConfig("a", 1, c1),
 		poolProviderConfig("b", 2, c2),
 	}})
@@ -255,11 +326,23 @@ func TestPool_CloseClosesAllProviders(t *testing.T) {
 	}
 }
 
+func TestPool_CloseIsIdempotentSafe(t *testing.T) {
+	client := newFakeEthClient()
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, client)}})
+
+	pool.Close()
+	pool.Close() // must not panic or double-close the underlying client
+
+	if got := atomic.LoadInt32(&client.closed); got != 1 {
+		t.Fatalf("expected the underlying client closed exactly once, got %d", got)
+	}
+}
+
 func TestPool_ConcurrentUseNoRace(t *testing.T) {
 	client := newFakeEthClient()
 	client.setBlockNumber(1)
 	client.setLogs([]types.Log{{BlockNumber: 1}})
-	pool := NewPool(PoolConfig{
+	pool := mustNewPool(t, PoolConfig{
 		Providers:      []ProviderConfig{poolProviderConfig("a", 1, client)},
 		UpdateInterval: time.Millisecond,
 	})

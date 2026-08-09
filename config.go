@@ -59,6 +59,16 @@ type ProviderConfig struct {
 	CircuitBreaker CircuitBreakerConfig
 	Retry          RetryConfig
 
+	// RequestTimeout bounds a single physical RPC attempt (one per retry, so
+	// a short timeout doesn't starve MaxAttempts — see Provider.withRetry).
+	// Applied via context.WithTimeout around the call passed to the
+	// underlying EthClient. Zero disables it (the caller's context, if any
+	// deadline at all, is the only bound) — matching how go-ethereum's
+	// ethclient itself has no built-in per-request timeout. Not applied to
+	// SubscribeNewHead, which is a long-lived subscription, not a
+	// request/response call.
+	RequestTimeout time.Duration
+
 	// Dial optionally overrides how the provider establishes its RPC
 	// client. Defaults to dialing URL (+APIKey) over JSON-RPC via
 	// go-ethereum's ethclient. Tests inject a fake EthClient through this.
@@ -110,4 +120,18 @@ type IndexerConfig struct {
 	// DebugMode re-processes from genesis every tick instead of resuming
 	// from the persisted last block. Intended for local development only.
 	DebugMode bool
+
+	// ReorgDepth opts into reorg detection beyond a full chain reset: the
+	// Indexer keeps the last ReorgDepth processed block hashes in memory
+	// and, each sync, re-verifies the chain's current hash at lastBlock
+	// still matches. A mismatch means a reorg happened at or below
+	// lastBlock (same height or a few blocks deep, not just a full
+	// devnet-style reset) — the Indexer rewinds up to ReorgDepth blocks and
+	// reprocesses them, relying on idempotent listeners for correctness.
+	// Zero (the default) disables this check entirely, preserving prior
+	// behaviour. The tracked hashes are in-memory only, not persisted, so
+	// this only protects a continuously running process — a fresh restart
+	// has nothing to compare against until it has processed ReorgDepth more
+	// blocks.
+	ReorgDepth int
 }

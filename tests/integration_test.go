@@ -193,7 +193,7 @@ func TestIntegration_FullPipeline(t *testing.T) {
 	flaky := newFlakyEthClient()
 	flaky.headerFailuresRemaining = 2 // recovered within RetryConfig.MaxAttempts below
 
-	pool := NewPool(PoolConfig{
+	pool := mustNewPool(t, PoolConfig{
 		UpdateInterval:   5 * time.Millisecond,
 		MaxLogBlockRange: 4, // global, applies to every provider: forces multiple chunks in the batch phase
 		Providers: []ProviderConfig{

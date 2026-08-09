@@ -24,12 +24,15 @@ type Provider struct {
 	circuitBreaker *CircuitBreaker
 	quota          *QuotaManager
 	retryCfg       RetryConfig
+	requestTimeout time.Duration
 
 	mu           sync.RWMutex
 	healthy      bool
 	lastUsed     time.Time
 	baseScore    float64
 	currentScore float64
+
+	closeOnce sync.Once
 }
 
 // NewProvider dials cfg.URL (via cfg.Dial, or go-ethereum's ethclient by
@@ -58,6 +61,7 @@ func NewProvider(ctx context.Context, cfg ProviderConfig) *Provider {
 		circuitBreaker: NewCircuitBreaker(cfg.CircuitBreaker),
 		quota:          newQuotaManager(cfg.Quota),
 		retryCfg:       cfg.Retry,
+		requestTimeout: cfg.RequestTimeout,
 		healthy:        err == nil && client != nil,
 		baseScore:      float64(cfg.Priority),
 		currentScore:   float64(cfg.Priority),
@@ -108,13 +112,25 @@ func (p *Provider) IsAvailable() bool {
 	return p.quota.Remaining()
 }
 
+// defaultScoreHeadroom is the RecordSuccess ceiling used when baseScore
+// isn't positive (Priority 0, the zero value, or an explicitly negative
+// one). baseScore*2 would otherwise be <= 0, permanently capping
+// currentScore at or below its starting point and leaving a provider that
+// recovered from failures (currentScore pulled below -1.0) with no way to
+// climb back to a positive, healthy-looking score.
+const defaultScoreHeadroom = 1.0
+
 func (p *Provider) RecordSuccess() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.healthy = true
 	p.currentScore += 0.1
-	if max := p.baseScore * 2; p.currentScore > max {
+	max := p.baseScore * 2
+	if max <= 0 {
+		max = defaultScoreHeadroom
+	}
+	if p.currentScore > max {
 		p.currentScore = max
 	}
 	p.lastUsed = time.Now()
@@ -183,6 +199,15 @@ func (p *Provider) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]ty
 	return result, err
 }
 
+// SubscribeNewHead opens a long-lived subscription directly against the
+// underlying client — deliberately bypassing retry, the circuit breaker,
+// RequestTimeout and quota, all of which are designed around bounded
+// request/response calls, not an open streaming connection. It also
+// doesn't record success/failure against the provider's health score.
+// Indexer itself never calls this (it polls via BlockNumber/HeaderByNumber
+// instead); callers using it directly through RPCProvider/ProviderPool are
+// responsible for their own reconnect/backoff logic on the returned
+// ethereum.Subscription.
 func (p *Provider) SubscribeNewHead(ctx context.Context, ch chan *types.Header) (ethereum.Subscription, error) {
 	if p.client == nil {
 		return nil, fmt.Errorf("provider %s: not connected", p.name)
@@ -240,20 +265,36 @@ func (p *Provider) CodeAt(ctx context.Context, address common.Address) ([]byte, 
 	return result, err
 }
 
-// withRetry consumes one unit of quota up front (a request denied by quota
-// is not sent at all, so it isn't retried or rate-limited) and then runs fn
-// through the rate limiter, circuit breaker and retry/backoff loop.
+// withRetry runs fn through the rate limiter, circuit breaker and
+// retry/backoff loop. Quota is consumed per physical attempt (not once per
+// logical call) so a metered-per-request provider (e.g. Alchemy compute
+// units) is charged for what retries actually send; an attempt denied by
+// quota fails fast without touching the rate limiter or breaker. Each
+// attempt also gets its own RequestTimeout, if configured, so a short
+// timeout doesn't starve later retries.
 func (p *Provider) withRetry(ctx context.Context, fn func(context.Context) error) error {
-	if !p.quota.Consume() {
-		return fmt.Errorf("provider %s: %w", p.name, ErrQuotaExceeded)
-	}
-	return WithRetry(ctx, p.retryCfg, fn, p.limiter, p.circuitBreaker)
+	return WithRetry(ctx, p.retryCfg, func(ctx context.Context) error {
+		if !p.quota.Consume() {
+			return fmt.Errorf("provider %s: %w", p.name, ErrQuotaExceeded)
+		}
+
+		callCtx := ctx
+		if p.requestTimeout > 0 {
+			var cancel context.CancelFunc
+			callCtx, cancel = context.WithTimeout(ctx, p.requestTimeout)
+			defer cancel()
+		}
+		return fn(callCtx)
+	}, p.limiter, p.circuitBreaker)
 }
 
+// Close is safe to call more than once; only the first call has any effect.
 func (p *Provider) Close() {
-	if p.client != nil {
-		p.client.Close()
-	}
+	p.closeOnce.Do(func() {
+		if p.client != nil {
+			p.client.Close()
+		}
+	})
 }
 
 func (p *Provider) GetQuotaUsage() (limit, used, creditsLimit, creditsUsed int64) {
@@ -266,6 +307,14 @@ func (p *Provider) GetQuotaRemaining() (limit, used, creditsLimit, creditsUsed i
 
 func (p *Provider) GetQuotaReset() (requestReset, creditReset time.Time) {
 	return p.quota.ResetTimes()
+}
+
+// RestoreQuotaUsage applies previously persisted request-quota usage (see
+// QuotaStorage, QuotaRestorer) back onto the provider, so a restart doesn't
+// forget how much of the current period's quota was already spent. Credits
+// aren't covered — Pool.PersistQuotaUsage doesn't persist them either.
+func (p *Provider) RestoreQuotaUsage(used int64, resetAt time.Time) {
+	p.quota.RestoreUsage(used, resetAt)
 }
 
 // QuotaManager tracks a rolling request/credit budget for one provider.
@@ -363,6 +412,18 @@ func (qm *QuotaManager) ResetTimes() (requestReset, creditReset time.Time) {
 	qm.mu.Lock()
 	defer qm.mu.Unlock()
 	return qm.resetTime, qm.creditReset
+}
+
+// RestoreUsage sets the request-quota counters directly, e.g. from
+// persisted state. If resetAt has already passed, the next Remaining or
+// Consume call rolls it over naturally — no special-casing needed here.
+func (qm *QuotaManager) RestoreUsage(used int64, resetAt time.Time) {
+	qm.mu.Lock()
+	defer qm.mu.Unlock()
+	qm.used = used
+	if !resetAt.IsZero() {
+		qm.resetTime = resetAt
+	}
 }
 
 var _ RPCProvider = (*Provider)(nil)
