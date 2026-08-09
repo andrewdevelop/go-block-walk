@@ -17,14 +17,23 @@ const (
 
 // Indexer polls a ProviderPool for new blocks on a fixed interval (or on
 // demand via Nudge), dispatches their logs to a BlockchainEventDispatcher,
-// and persists sync progress to a Storage. It depends only on the
-// ProviderPool, Storage and BlockchainEventDispatcher interfaces, so any
-// implementation of each can be plugged in — including fakes in tests.
+// and persists sync progress to a ChainStorage. It depends only on the
+// ProviderPool, ChainStorage and BlockchainEventDispatcher interfaces, so
+// any implementation of each can be plugged in — including fakes in tests.
+//
+// Persisting provider health scores and quota usage (see ScoreStorage,
+// QuotaStorage) is optional: if the ChainStorage passed to NewIndexer also
+// implements one or both, the Indexer persists that data as a side effect
+// of normal syncing; if not, it's silently skipped. A minimal ChainStorage
+// implementation with no score/quota persistence is a complete, valid
+// Indexer backend.
 type Indexer struct {
 	config     IndexerConfig
 	pool       ProviderPool
 	dispatcher BlockchainEventDispatcher
-	storage    Storage
+	storage    ChainStorage
+	scores     ScoreStorage // nil if storage doesn't implement ScoreStorage
+	quotas     QuotaStorage // nil if storage doesn't implement QuotaStorage
 	logger     *slog.Logger
 
 	mu        sync.RWMutex
@@ -76,8 +85,9 @@ func WithOnExhausted(fn func(err error)) Option {
 }
 
 // NewIndexer wires up an Indexer. pool, storage and dispatcher must be
-// non-nil.
-func NewIndexer(cfg IndexerConfig, pool ProviderPool, storage Storage, dispatcher BlockchainEventDispatcher, opts ...Option) (*Indexer, error) {
+// non-nil. If storage also implements ScoreStorage and/or QuotaStorage,
+// that data is persisted automatically; otherwise it's skipped.
+func NewIndexer(cfg IndexerConfig, pool ProviderPool, storage ChainStorage, dispatcher BlockchainEventDispatcher, opts ...Option) (*Indexer, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("idx: pool is required")
 	}
@@ -103,11 +113,16 @@ func NewIndexer(cfg IndexerConfig, pool ProviderPool, storage Storage, dispatche
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	scores, _ := storage.(ScoreStorage)
+	quotas, _ := storage.(QuotaStorage)
+
 	idx := &Indexer{
 		config:      cfg,
 		pool:        pool,
 		dispatcher:  dispatcher,
 		storage:     storage,
+		scores:      scores,
+		quotas:      quotas,
 		logger:      slog.Default(),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -341,19 +356,22 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 	return nil
 }
 
-// persistProviderState saves provider scores and quota usage to storage.
-// Called after each block in the sequential path and after each chunk in
-// the batched path.
+// persistProviderState saves provider scores and quota usage to storage,
+// if it supports either (see ScoreStorage, QuotaStorage). Called after each
+// block in the sequential path and after each chunk in the batched path.
 func (idx *Indexer) persistProviderState() {
-	scores := idx.pool.GetScores()
-	for provider, score := range scores {
-		if err := idx.storage.SetProviderScore(idx.ctx, provider, score, 0); err != nil {
-			idx.logger.Warn("failed to save provider score", "provider", provider, "error", err)
+	if idx.scores != nil {
+		for provider, score := range idx.pool.GetScores() {
+			if err := idx.scores.SetProviderScore(idx.ctx, provider, score, 0); err != nil {
+				idx.logger.Warn("failed to save provider score", "provider", provider, "error", err)
+			}
 		}
 	}
 
-	if err := idx.pool.PersistQuotaUsage(idx.ctx, idx.storage); err != nil {
-		idx.logger.Warn("failed to persist quota usage", "error", err)
+	if idx.quotas != nil {
+		if err := idx.pool.PersistQuotaUsage(idx.ctx, idx.quotas); err != nil {
+			idx.logger.Warn("failed to persist quota usage", "error", err)
+		}
 	}
 }
 
@@ -421,5 +439,5 @@ func (idx *Indexer) IsRunning() bool {
 }
 
 func (idx *Indexer) Pool() ProviderPool                    { return idx.pool }
-func (idx *Indexer) Storage() Storage                      { return idx.storage }
+func (idx *Indexer) Storage() ChainStorage                 { return idx.storage }
 func (idx *Indexer) Dispatcher() BlockchainEventDispatcher { return idx.dispatcher }

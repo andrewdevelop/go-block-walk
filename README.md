@@ -4,11 +4,13 @@ A reusable, thread-safe EVM blockchain indexer for Go: a pool of RPC
 providers with health scoring, rate limiting, circuit breaking, retries
 and quota tracking, feeding a block-by-block (or batched) sync loop that
 dispatches decoded logs to your listeners and persists progress through a
-small `Storage` interface.
+small `ChainStorage` interface.
 
-No concrete storage backend is bundled — implement `Storage` against your
-own database, or use the included in-memory `Memory` store for tests, demos,
-and local development.
+No concrete storage backend is bundled — implement `ChainStorage` against
+your own database (that alone is a complete Indexer backend — persisting
+provider health scores and quota usage is optional, see
+[Custom storage backends](#custom-storage-backends)), or use the included
+in-memory `Memory` store for tests, demos, and local development.
 
 The public API is Go package `idx`, imported from module path
 `github.com/andrewdevelop/go-block-walk`:
@@ -30,15 +32,20 @@ import idx "github.com/andrewdevelop/go-block-walk"
   (`Nudge`), automatically switching between a low-latency sequential path
   and a chunked `eth_getLogs` batch path once it falls behind by more than
   `BatchLagThreshold` blocks.
-- **Pluggable storage** — the `Storage` interface is the only thing you
-  need to implement to back the indexer with your own database. `Memory`
-  ships a fully thread-safe in-memory implementation.
+- **Pluggable, segregated storage** — `ChainStorage` (sync progress +
+  indexed events) is the only thing you need to implement to back the
+  indexer with your own database. `ScoreStorage` and `QuotaStorage` (health
+  scores / quota bookkeeping) are separate, optional interfaces — the
+  Indexer detects them via a type assertion and simply skips persisting
+  that data if your storage doesn't implement them. `Memory` implements all
+  three.
 - **Domain errors** — `ErrNoAvailableProvider`, `ErrRetriesExhausted`,
   `ErrQuotaExceeded`, and `ErrProviderPoolExhausted` are exported sentinels
   you can match with `errors.Is`, instead of parsing error strings.
 - **Everything is an interface** — `ProviderPool`, `RPCProvider`,
-  `Storage`, `BlockchainListener`, `BlockchainEventDispatcher` — so any
-  piece can be swapped or faked independently in your own tests.
+  `ChainStorage`, `ScoreStorage`, `QuotaStorage`, `BlockchainListener`,
+  `BlockchainEventDispatcher` — so any piece can be swapped or faked
+  independently in your own tests.
 
 ## Install
 
@@ -73,6 +80,10 @@ func (myListener) HandleLog(l types.Log, blockTimestamp uint64) error {
 
 func main() {
 	pool := idx.NewPool(idx.PoolConfig{
+		// How many blocks a single eth_getLogs call may span when the
+		// indexer batches a backfill, applied to every provider below.
+		// Defaults to 1 (no real batching) if left unset.
+		MaxLogBlockRange: 2000,
 		Providers: []idx.ProviderConfig{
 			{
 				Name:     "primary",
@@ -93,7 +104,7 @@ func main() {
 	})
 	defer pool.Close()
 
-	storage := idx.NewMemory() // swap for your own Storage implementation in production
+	storage := idx.NewMemory() // swap for your own ChainStorage implementation in production
 	dispatcher := idx.NewEventDispatcher([]idx.BlockchainListener{myListener{}})
 
 	indexer, err := idx.NewIndexer(
@@ -148,7 +159,7 @@ func main() {
 │ Indexer│──────────────────────────────▶│  your listeners    │
 └────────┘                               └───────────────────┘
   │
-  │ Storage interface
+  │ ChainStorage interface (+ optional ScoreStorage, QuotaStorage)
   ▼
 ┌──────────────┐
 │ Memory (impl)│  ← or your own Postgres/SQLite/... implementation
@@ -160,11 +171,16 @@ func main() {
   rate limiter, circuit breaker, retry loop and quota manager.
 - **`Pool`** holds several `Provider`s, periodically re-ranks them by health
   score (`PoolConfig.UpdateInterval`, default 30s), and always routes each
-  call to the best currently-available one.
-- **`Indexer`** depends only on the `ProviderPool`, `Storage` and
+  call to the best currently-available one. It also owns
+  `PoolConfig.MaxLogBlockRange` — one eth_getLogs chunk size applied
+  uniformly to every provider (default 1); there's no per-provider override.
+- **`Indexer`** depends only on the `ProviderPool`, `ChainStorage` and
   `BlockchainEventDispatcher` interfaces — never on `Pool`/`Memory`
   directly — so you can inject fakes in your own tests exactly like this
-  module's own test suite does.
+  module's own test suite does. It persists provider health scores and
+  quota usage too, but only if the `ChainStorage` you hand it also happens
+  to implement `ScoreStorage`/`QuotaStorage` (detected via a type
+  assertion) — neither is required.
 
 ## Handling provider pool exhaustion
 
@@ -191,19 +207,15 @@ tick — so opting into a restart is a deliberate choice, not baked-in
 
 ## Custom storage backends
 
-Implement the `Storage` interface (see `ports.go`) against your database:
+Persistence is split into three interfaces (see `ports.go`) instead of one
+monolithic `Storage`, so implementing a backend only costs you what you
+actually use:
 
 ```go
-type Storage interface {
+// Required — the only thing NewIndexer needs.
+type ChainStorage interface {
 	GetLastBlock(ctx context.Context, chain string) (uint64, error)
 	SetLastBlock(ctx context.Context, chain string, blockNum uint64) error
-
-	GetProviderScore(ctx context.Context, provider string) (*ProviderScore, error)
-	SetProviderScore(ctx context.Context, provider string, score, penalty float64) error
-	GetAllProviderScores(ctx context.Context) ([]ProviderScore, error)
-
-	GetQuotaUsage(ctx context.Context, provider, quotaType string) (*QuotaUsage, error)
-	SetQuotaUsage(ctx context.Context, provider, quotaType string, used int, resetAt time.Time) error
 
 	SaveIndexedEvent(ctx context.Context, event *IndexedEvent) error
 	GetIndexedEvents(ctx context.Context, chain string, fromBlock, toBlock uint64) ([]IndexedEvent, error)
@@ -211,7 +223,52 @@ type Storage interface {
 
 	Close() error
 }
+
+// Optional — implement it and the Indexer persists provider health scores
+// as a side effect of syncing; skip it and that's simply not tracked.
+type ScoreStorage interface {
+	GetProviderScore(ctx context.Context, provider string) (*ProviderScore, error)
+	SetProviderScore(ctx context.Context, provider string, score, penalty float64) error
+	GetAllProviderScores(ctx context.Context) ([]ProviderScore, error)
+}
+
+// Optional — same deal, for provider quota usage.
+type QuotaStorage interface {
+	GetQuotaUsage(ctx context.Context, provider, quotaType string) (*QuotaUsage, error)
+	SetQuotaUsage(ctx context.Context, provider, quotaType string, used int, resetAt time.Time) error
+}
+
+// Storage = ChainStorage + ScoreStorage + QuotaStorage, provided purely as
+// a "my backend does all three" shorthand. Memory implements it.
+type Storage interface {
+	ChainStorage
+	ScoreStorage
+	QuotaStorage
+}
 ```
+
+`NewIndexer` takes a `ChainStorage`; at construction it type-asserts that
+value against `ScoreStorage` and `QuotaStorage` and persists whichever it
+finds. A store backing only `ChainStorage` — no score/quota tracking at
+all — is a complete, valid Indexer backend (see
+`tests/storage_segregation_test.go`'s `chainOnlyStorage` for a minimal
+example). `Pool.PersistQuotaUsage` likewise only asks for `QuotaStorage`.
+
+`Memory` mirrors this split internally rather than being one 200-line type:
+it's a thin composition of three independent, independently testable
+pieces, each with its own lock —
+
+```go
+type Memory struct {
+	*MemoryChainStorage
+	*MemoryScoreStorage
+	*MemoryQuotaStorage
+}
+```
+
+— so `idx.NewMemoryChainStorage()` alone is a real, usable `ChainStorage`
+if that's genuinely all you want in memory (e.g. in a test), without
+allocating score/quota bookkeeping you'll never touch.
 
 `SaveIndexedEvent` must be idempotent under a duplicate `(chain,
 block_number, log_index)` key — `Memory` treats a duplicate insert as a
@@ -249,7 +306,7 @@ go test ./tests/... -run TestIntegration -v      # just the end-to-end pipeline 
 
 ```
 .
-├── ports.go        interfaces + data types (RPCProvider, ProviderPool, Storage, ...)
+├── ports.go        interfaces + data types (RPCProvider, ProviderPool, ChainStorage, ScoreStorage, QuotaStorage, ...)
 ├── config.go        config structs (RateLimitConfig, CircuitBreakerConfig, RetryConfig, ...)
 ├── errors.go        exported sentinel errors
 ├── ethclient.go      EthClient interface + default go-ethereum dial
@@ -262,6 +319,9 @@ go test ./tests/... -run TestIntegration -v      # just the end-to-end pipeline 
 ├── exhaustion.go       ExhaustionTracker
 ├── nudge.go          NudgeSignal
 ├── indexer.go        Indexer (the sync loop)
-├── memory.go          Memory (in-memory Storage)
+├── memory.go          Memory (composes the three pieces below into the full Storage)
+├── memorychain.go     MemoryChainStorage (in-memory ChainStorage)
+├── memoryscore.go     MemoryScoreStorage (in-memory ScoreStorage)
+├── memoryquota.go     MemoryQuotaStorage (in-memory QuotaStorage)
 └── tests/            black-box test suite (package idx_test)
 ```

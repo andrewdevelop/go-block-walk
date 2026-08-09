@@ -129,11 +129,13 @@ func (f *flakyEthClient) setForceFailure(err error) {
 
 var _ EthClient = (*flakyEthClient)(nil)
 
-// persistingListener writes every log it receives into a Storage as an
+// persistingListener writes every log it receives into a ChainStorage as an
 // IndexedEvent — standing in for a real consumer that projects raw chain
-// logs into its own domain/event store.
+// logs into its own domain/event store. It only needs ChainStorage, not
+// the full Storage — proof that a listener doesn't have to care whether
+// the backing store also does score/quota bookkeeping.
 type persistingListener struct {
-	storage Storage
+	storage ChainStorage
 	chain   string
 
 	mu    sync.Mutex
@@ -188,7 +190,8 @@ func TestIntegration_FullPipeline(t *testing.T) {
 	flaky.headerFailuresRemaining = 2 // recovered within RetryConfig.MaxAttempts below
 
 	pool := NewPool(PoolConfig{
-		UpdateInterval: 5 * time.Millisecond,
+		UpdateInterval:   5 * time.Millisecond,
+		MaxLogBlockRange: 4, // global, applies to every provider: forces multiple chunks in the batch phase
 		Providers: []ProviderConfig{
 			{
 				// Tried first (lower Priority number) but always down —
@@ -201,12 +204,11 @@ func TestIntegration_FullPipeline(t *testing.T) {
 				Retry:    RetryConfig{MaxAttempts: 1},
 			},
 			{
-				Name:             "primary",
-				URL:              "http://primary.invalid",
-				Priority:         2,
-				MaxLogBlockRange: 4, // forces multiple chunks in the batch phase
-				Dial:             testDial(flaky, nil),
-				RateLimit:        RateLimitConfig{Enabled: true, RPS: 1000, Burst: 1000},
+				Name:      "primary",
+				URL:       "http://primary.invalid",
+				Priority:  2,
+				Dial:      testDial(flaky, nil),
+				RateLimit: RateLimitConfig{Enabled: true, RPS: 1000, Burst: 1000},
 				CircuitBreaker: CircuitBreakerConfig{
 					Enabled: true, Threshold: 3, Timeout: 10 * time.Second, HalfOpenMaxCalls: 1,
 				},

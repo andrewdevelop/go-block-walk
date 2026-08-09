@@ -1,14 +1,16 @@
 // Package idx is a reusable, chain-agnostic-storage EVM blockchain indexer:
 // a pool of RPC providers with health tracking, rate limiting, circuit
 // breaking and retries, feeding a block-by-block sync loop that dispatches
-// decoded logs to listeners and persists progress through a small Storage
-// interface. No concrete storage backend is bundled — implement Storage
-// against your own database, or use the in-memory Memory store included
-// here for tests, demos, and local development.
+// decoded logs to listeners and persists progress through a small
+// ChainStorage interface. No concrete storage backend is bundled —
+// implement ChainStorage (plus, optionally, ScoreStorage and/or
+// QuotaStorage) against your own database, or use the in-memory Memory
+// store included here for tests, demos, and local development.
 //
 // The exported surface is built entirely around interfaces (RPCProvider,
-// ProviderPool, Storage, BlockchainListener, BlockchainEventDispatcher) so
-// every piece can be swapped or faked in tests independently of the others.
+// ProviderPool, ChainStorage, ScoreStorage, QuotaStorage,
+// BlockchainListener, BlockchainEventDispatcher) so every piece can be
+// swapped or faked in tests independently of the others.
 package idx
 
 import (
@@ -44,10 +46,6 @@ type RPCProvider interface {
 	RecordFailure(err error)
 	Close()
 
-	// MaxLogBlockRange is the largest block range this provider allows in a
-	// single eth_getLogs call, used when the indexer batches a backfill.
-	MaxLogBlockRange() int
-
 	BlockByNumber(ctx context.Context, blockNum uint64) (*types.Block, error)
 	BlockByHash(ctx context.Context, hash common.Hash) (*types.Block, error)
 	TransactionByHash(ctx context.Context, hash common.Hash) (*types.Transaction, bool, error)
@@ -69,7 +67,7 @@ type ProviderPool interface {
 	RecordSuccess(provider RPCProvider)
 	RecordFailure(provider RPCProvider, err error)
 	GetScores() map[string]float64
-	PersistQuotaUsage(ctx context.Context, storage Storage) error
+	PersistQuotaUsage(ctx context.Context, storage QuotaStorage) error
 	Close()
 
 	BlockByNumber(ctx context.Context, blockNum uint64) (*types.Block, error)
@@ -85,33 +83,54 @@ type ProviderPool interface {
 	BalanceAt(ctx context.Context, address common.Address) (*big.Int, error)
 	CodeAt(ctx context.Context, address common.Address) ([]byte, error)
 
-	// MaxLogBlockRange is the currently selected provider's max eth_getLogs
-	// block range (see RPCProvider.MaxLogBlockRange). Falls back to a safe
-	// default when no provider is currently available.
+	// MaxLogBlockRange is the pool-wide max eth_getLogs block range (see
+	// PoolConfig.MaxLogBlockRange), used when the indexer batches a backfill.
 	MaxLogBlockRange() int
 }
 
-// Storage persists the indexer's operational state: sync progress, provider
-// health/quota bookkeeping, and the events it has already indexed. This
-// package ships no concrete backend (e.g. Postgres) — implement it against
-// whatever fits the host application, or use Memory for tests/local
-// development.
-type Storage interface {
+// ChainStorage persists the indexer's core, chain-related state: sync
+// progress and the events it has already indexed. It is the only storage
+// capability the Indexer strictly requires — implement just this to back
+// the indexer with your own database.
+type ChainStorage interface {
 	GetLastBlock(ctx context.Context, chain string) (uint64, error)
 	SetLastBlock(ctx context.Context, chain string, blockNum uint64) error
-
-	GetProviderScore(ctx context.Context, provider string) (*ProviderScore, error)
-	SetProviderScore(ctx context.Context, provider string, score, penalty float64) error
-	GetAllProviderScores(ctx context.Context) ([]ProviderScore, error)
-
-	GetQuotaUsage(ctx context.Context, provider, quotaType string) (*QuotaUsage, error)
-	SetQuotaUsage(ctx context.Context, provider, quotaType string, used int, resetAt time.Time) error
 
 	SaveIndexedEvent(ctx context.Context, event *IndexedEvent) error
 	GetIndexedEvents(ctx context.Context, chain string, fromBlock, toBlock uint64) ([]IndexedEvent, error)
 	IsEventIndexed(ctx context.Context, chain string, blockNumber uint64, logIndex uint) (bool, error)
 
 	Close() error
+}
+
+// ScoreStorage persists RPC provider health scores across restarts. It is
+// optional: the Indexer type-asserts its ChainStorage against this
+// interface and simply skips persisting scores if it isn't implemented.
+type ScoreStorage interface {
+	GetProviderScore(ctx context.Context, provider string) (*ProviderScore, error)
+	SetProviderScore(ctx context.Context, provider string, score, penalty float64) error
+	GetAllProviderScores(ctx context.Context) ([]ProviderScore, error)
+}
+
+// QuotaStorage persists RPC provider quota usage across restarts. Optional,
+// same as ScoreStorage — a ProviderPool that tracks no quotas, or a Storage
+// that doesn't care to persist them, need not implement it.
+type QuotaStorage interface {
+	GetQuotaUsage(ctx context.Context, provider, quotaType string) (*QuotaUsage, error)
+	SetQuotaUsage(ctx context.Context, provider, quotaType string, used int, resetAt time.Time) error
+}
+
+// Storage is the full persistence surface: ChainStorage plus the optional
+// ScoreStorage and QuotaStorage capabilities. This package ships no
+// concrete backend (e.g. Postgres) — implement whichever of the three
+// interfaces fit the host application, or use Memory (which implements all
+// three) for tests/local development. NewIndexer only requires
+// ChainStorage; Storage exists as a convenient "implements everything"
+// shorthand for callers that want it.
+type Storage interface {
+	ChainStorage
+	ScoreStorage
+	QuotaStorage
 }
 
 type ProviderScore struct {

@@ -16,6 +16,11 @@ import (
 
 const defaultPoolUpdateInterval = 30 * time.Second
 
+// DefaultMaxLogBlockRange is used when PoolConfig doesn't set
+// MaxLogBlockRange, keeping batched eth_getLogs calls conservative (one
+// block per call) by default — real batching is an opt-in.
+const DefaultMaxLogBlockRange = 1
+
 // Pool selects a healthy Provider for each call, biased towards whichever
 // provider currently has the best health score, and tracks success/failure
 // against whichever provider actually served the request. Safe for
@@ -26,10 +31,11 @@ type Pool struct {
 	orderedList []*Provider
 	penalties   map[string]float64
 
-	updateInterval time.Duration
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	updateInterval   time.Duration
+	maxLogBlockRange int
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
 }
 
 // NewPool dials every configured provider and starts a background loop that
@@ -42,13 +48,19 @@ func NewPool(cfg PoolConfig) *Pool {
 		updateInterval = defaultPoolUpdateInterval
 	}
 
+	maxLogBlockRange := cfg.MaxLogBlockRange
+	if maxLogBlockRange <= 0 {
+		maxLogBlockRange = DefaultMaxLogBlockRange
+	}
+
 	pool := &Pool{
-		providers:      make(map[string]*Provider, len(cfg.Providers)),
-		orderedList:    make([]*Provider, 0, len(cfg.Providers)),
-		penalties:      make(map[string]float64),
-		updateInterval: updateInterval,
-		ctx:            ctx,
-		cancel:         cancel,
+		providers:        make(map[string]*Provider, len(cfg.Providers)),
+		orderedList:      make([]*Provider, 0, len(cfg.Providers)),
+		penalties:        make(map[string]float64),
+		updateInterval:   updateInterval,
+		maxLogBlockRange: maxLogBlockRange,
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 
 	for _, pc := range cfg.Providers {
@@ -258,28 +270,11 @@ func (pool *Pool) LogsByBlockRange(ctx context.Context, fromBlock, toBlock uint6
 	})
 }
 
-// MaxLogBlockRange returns the currently selected provider's max
-// eth_getLogs block range. If no provider is currently available, it falls
-// back to the smallest configured range across all providers (the safest
-// choice), or the package default if the pool has no providers at all.
+// MaxLogBlockRange returns the pool's configured eth_getLogs chunk size
+// (see PoolConfig.MaxLogBlockRange) — the same value for every provider in
+// the pool, resolved once at construction.
 func (pool *Pool) MaxLogBlockRange() int {
-	if p := pool.GetProvider(); p != nil {
-		return p.MaxLogBlockRange()
-	}
-
-	pool.mu.RLock()
-	defer pool.mu.RUnlock()
-
-	min := 0
-	for _, p := range pool.orderedList {
-		if r := p.MaxLogBlockRange(); min == 0 || r < min {
-			min = r
-		}
-	}
-	if min == 0 {
-		min = DefaultMaxLogBlockRange
-	}
-	return min
+	return pool.maxLogBlockRange
 }
 
 func (pool *Pool) SubscribeNewHead(ctx context.Context, ch chan *types.Header) (ethereum.Subscription, error) {
@@ -370,7 +365,7 @@ func (pool *Pool) GetScores() map[string]float64 {
 	return scores
 }
 
-func (pool *Pool) PersistQuotaUsage(ctx context.Context, storage Storage) error {
+func (pool *Pool) PersistQuotaUsage(ctx context.Context, storage QuotaStorage) error {
 	pool.mu.RLock()
 	defer pool.mu.RUnlock()
 

@@ -57,7 +57,7 @@ func (p *fakePool) GetAllProviders() []RPCProvider                { return []RPC
 func (p *fakePool) RecordSuccess(provider RPCProvider)            {}
 func (p *fakePool) RecordFailure(provider RPCProvider, err error) {}
 func (p *fakePool) GetScores() map[string]float64                 { return map[string]float64{"fake": 1} }
-func (p *fakePool) PersistQuotaUsage(ctx context.Context, storage Storage) error {
+func (p *fakePool) PersistQuotaUsage(ctx context.Context, storage QuotaStorage) error {
 	return storage.SetQuotaUsage(ctx, "fake", "requests", 0, time.Now())
 }
 func (p *fakePool) Close() {}
@@ -174,15 +174,14 @@ func (p *fakePool) callCounts() (blockNumberCalls, logsCalls int) {
 // fakeProviderHandle is a stand-in RPCProvider returned by fakePool.GetProvider.
 type fakeProviderHandle struct{ name string }
 
-func (h *fakeProviderHandle) Name() string          { return h.name }
-func (h *fakeProviderHandle) Priority() int         { return 0 }
-func (h *fakeProviderHandle) Score() float64        { return 1 }
-func (h *fakeProviderHandle) SetScore(float64)      {}
-func (h *fakeProviderHandle) IsAvailable() bool     { return true }
-func (h *fakeProviderHandle) RecordSuccess()        {}
-func (h *fakeProviderHandle) RecordFailure(error)   {}
-func (h *fakeProviderHandle) Close()                {}
-func (h *fakeProviderHandle) MaxLogBlockRange() int { return 10 }
+func (h *fakeProviderHandle) Name() string        { return h.name }
+func (h *fakeProviderHandle) Priority() int       { return 0 }
+func (h *fakeProviderHandle) Score() float64      { return 1 }
+func (h *fakeProviderHandle) SetScore(float64)    {}
+func (h *fakeProviderHandle) IsAvailable() bool   { return true }
+func (h *fakeProviderHandle) RecordSuccess()      {}
+func (h *fakeProviderHandle) RecordFailure(error) {}
+func (h *fakeProviderHandle) Close()              {}
 func (h *fakeProviderHandle) BlockByNumber(ctx context.Context, blockNum uint64) (*types.Block, error) {
 	return nil, errNotImplemented
 }
@@ -245,7 +244,7 @@ type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-func newTestIndexer(t *testing.T, cfg IndexerConfig, pool ProviderPool, store Storage, dispatcher BlockchainEventDispatcher, opts ...Option) *Indexer {
+func newTestIndexer(t *testing.T, cfg IndexerConfig, pool ProviderPool, store ChainStorage, dispatcher BlockchainEventDispatcher, opts ...Option) *Indexer {
 	t.Helper()
 	if cfg.Chain == "" {
 		cfg.Chain = "eth"

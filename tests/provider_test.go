@@ -204,18 +204,6 @@ func TestProvider_QuotaCreditsRollover(t *testing.T) {
 	}
 }
 
-func TestProvider_MaxLogBlockRangeDefault(t *testing.T) {
-	p := newTestProvider(t, newFakeEthClient(), ProviderConfig{})
-	if p.MaxLogBlockRange() != DefaultMaxLogBlockRange {
-		t.Fatalf("expected default max log block range %d, got %d", DefaultMaxLogBlockRange, p.MaxLogBlockRange())
-	}
-
-	p2 := newTestProvider(t, newFakeEthClient(), ProviderConfig{MaxLogBlockRange: 500})
-	if p2.MaxLogBlockRange() != 500 {
-		t.Fatalf("expected configured max log block range 500, got %d", p2.MaxLogBlockRange())
-	}
-}
-
 func TestProvider_FilterLogsPropagatesResults(t *testing.T) {
 	client := newFakeEthClient()
 	client.setLogs([]types.Log{{BlockNumber: 1}, {BlockNumber: 2}})

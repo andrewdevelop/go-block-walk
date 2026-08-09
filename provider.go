@@ -12,23 +12,18 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// DefaultMaxLogBlockRange is used when a provider config doesn't set
-// MaxLogBlockRange, keeping batched eth_getLogs calls conservative by default.
-const DefaultMaxLogBlockRange = 2_000
-
 // Provider is a single upstream RPC endpoint wrapped with rate limiting,
 // circuit breaking, retries, quota tracking and a health score. Safe for
 // concurrent use.
 type Provider struct {
-	name             string
-	priority         int
-	maxLogBlockRange int
-	client           EthClient
-	dialErr          error
-	limiter          *RateLimiter
-	circuitBreaker   *CircuitBreaker
-	quota            *QuotaManager
-	retryCfg         RetryConfig
+	name           string
+	priority       int
+	client         EthClient
+	dialErr        error
+	limiter        *RateLimiter
+	circuitBreaker *CircuitBreaker
+	quota          *QuotaManager
+	retryCfg       RetryConfig
 
 	mu           sync.RWMutex
 	healthy      bool
@@ -54,30 +49,23 @@ func NewProvider(ctx context.Context, cfg ProviderConfig) *Provider {
 
 	client, err := dial(ctx, url)
 
-	maxLogBlockRange := cfg.MaxLogBlockRange
-	if maxLogBlockRange <= 0 {
-		maxLogBlockRange = DefaultMaxLogBlockRange
-	}
-
 	return &Provider{
-		name:             cfg.Name,
-		priority:         cfg.Priority,
-		maxLogBlockRange: maxLogBlockRange,
-		client:           client,
-		dialErr:          err,
-		limiter:          NewRateLimiter(cfg.RateLimit),
-		circuitBreaker:   NewCircuitBreaker(cfg.CircuitBreaker),
-		quota:            newQuotaManager(cfg.Quota),
-		retryCfg:         cfg.Retry,
-		healthy:          err == nil && client != nil,
-		baseScore:        float64(cfg.Priority),
-		currentScore:     float64(cfg.Priority),
+		name:           cfg.Name,
+		priority:       cfg.Priority,
+		client:         client,
+		dialErr:        err,
+		limiter:        NewRateLimiter(cfg.RateLimit),
+		circuitBreaker: NewCircuitBreaker(cfg.CircuitBreaker),
+		quota:          newQuotaManager(cfg.Quota),
+		retryCfg:       cfg.Retry,
+		healthy:        err == nil && client != nil,
+		baseScore:      float64(cfg.Priority),
+		currentScore:   float64(cfg.Priority),
 	}
 }
 
 func (p *Provider) Name() string           { return p.name }
 func (p *Provider) Priority() int          { return p.priority }
-func (p *Provider) MaxLogBlockRange() int  { return p.maxLogBlockRange }
 func (p *Provider) SetScore(score float64) { p.mu.Lock(); defer p.mu.Unlock(); p.currentScore = score }
 
 func (p *Provider) Score() float64 {

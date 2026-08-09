@@ -121,25 +121,28 @@ func TestPool_RecordSuccessAndFailureRouteToNamedProvider(t *testing.T) {
 	}
 }
 
-func TestPool_MaxLogBlockRangeFallsBackToSmallestWhenNoneAvailable(t *testing.T) {
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
-		{Name: "a", Priority: 1, MaxLogBlockRange: 100, Dial: testDial(nil, errors.New("down")), Retry: RetryConfig{MaxAttempts: 1}},
-		{Name: "b", Priority: 2, MaxLogBlockRange: 50, Dial: testDial(nil, errors.New("down")), Retry: RetryConfig{MaxAttempts: 1}},
-	}})
+func TestPool_MaxLogBlockRangeDefaultsToOne(t *testing.T) {
+	pool := NewPool(PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, newFakeEthClient())}})
 	defer pool.Close()
 
-	if got := pool.MaxLogBlockRange(); got != 50 {
-		t.Fatalf("expected fallback to the smallest configured range (50), got %d", got)
+	if got := pool.MaxLogBlockRange(); got != DefaultMaxLogBlockRange {
+		t.Fatalf("expected the default (%d), got %d", DefaultMaxLogBlockRange, got)
 	}
 }
 
-func TestPool_MaxLogBlockRangeUsesSelectedProvider(t *testing.T) {
-	client := newFakeEthClient()
-	pool := NewPool(PoolConfig{Providers: []ProviderConfig{
-		{Name: "a", Priority: 1, MaxLogBlockRange: 777, Dial: testDial(client, nil), Retry: RetryConfig{MaxAttempts: 1}},
-	}})
+func TestPool_MaxLogBlockRangeAppliesGloballyToAllProviders(t *testing.T) {
+	pool := NewPool(PoolConfig{
+		MaxLogBlockRange: 777,
+		Providers: []ProviderConfig{
+			poolProviderConfig("a", 1, newFakeEthClient()),
+			poolProviderConfig("b", 2, newFakeEthClient()),
+		},
+	})
 	defer pool.Close()
 
+	// The configured value applies uniformly, regardless of which provider
+	// (if any) is currently selected — there's no more per-provider value
+	// to fall back on.
 	if got := pool.MaxLogBlockRange(); got != 777 {
 		t.Fatalf("expected 777, got %d", got)
 	}

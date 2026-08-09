@@ -10,8 +10,10 @@ repository. See `README.md` for user-facing documentation.
 blockchain indexer library: an RPC provider pool with health scoring, rate
 limiting, circuit breaking, retries and quota tracking, feeding a
 block-by-block sync loop. It ships **no concrete storage backend** —
-`Storage` is an interface; `Memory` is the only implementation in this repo,
-and it exists for tests/demos, not production persistence.
+persistence is split into `ChainStorage` (required), `ScoreStorage` and
+`QuotaStorage` (both optional), all interfaces; `Memory` is the only
+implementation in this repo (it implements all three, i.e. the composite
+`Storage`), and it exists for tests/demos, not production persistence.
 
 ## Layout
 
@@ -20,7 +22,7 @@ the repo root as `package idx`, no subpackages:
 
 | File | Contents |
 |---|---|
-| `ports.go` | All exported interfaces (`RPCProvider`, `ProviderPool`, `Storage`, `BlockchainListener`, `BlockchainEventDispatcher`) and their data types |
+| `ports.go` | All exported interfaces (`RPCProvider`, `ProviderPool`, `ChainStorage`, `ScoreStorage`, `QuotaStorage`, `Storage`, `BlockchainListener`, `BlockchainEventDispatcher`) and their data types |
 | `config.go` | Config structs (`RateLimitConfig`, `CircuitBreakerConfig`, `RetryConfig`, `QuotaConfig`, `ProviderConfig`, `PoolConfig`, `IndexerConfig`) |
 | `errors.go` | Exported sentinel errors (`ErrNoAvailableProvider`, `ErrQuotaExceeded`, `ErrRetriesExhausted`, `ErrProviderPoolExhausted`, `ErrAlreadyRunning`) |
 | `ethclient.go` | `EthClient` interface (subset of `*ethclient.Client`) + `DialFunc`, so RPC calls are mockable in tests |
@@ -30,8 +32,11 @@ the repo root as `package idx`, no subpackages:
 | `dispatcher.go` | `EventDispatcher` — fans a log out to listeners, stops at first error |
 | `exhaustion.go` | `ExhaustionTracker` — counts consecutive "no provider available" attempts |
 | `nudge.go` | `NudgeSignal` — coalescing wake-up channel |
-| `indexer.go` | `Indexer` — the sync loop; depends only on `ProviderPool`/`Storage`/`BlockchainEventDispatcher` interfaces, never on `Pool`/`Memory` concretely |
-| `memory.go` | `Memory` — thread-safe in-memory `Storage` |
+| `indexer.go` | `Indexer` — the sync loop; depends on `ProviderPool`/`ChainStorage`/`BlockchainEventDispatcher` interfaces (plus `ScoreStorage`/`QuotaStorage`, detected optionally via type assertion), never on `Pool`/`Memory` concretely |
+| `memory.go` | `Memory` — composes the three pieces below (embedding) into the full `Storage` |
+| `memorychain.go` | `MemoryChainStorage` — thread-safe in-memory `ChainStorage`, standalone-usable |
+| `memoryscore.go` | `MemoryScoreStorage` — thread-safe in-memory `ScoreStorage`, standalone-usable |
+| `memoryquota.go` | `MemoryQuotaStorage` — thread-safe in-memory `QuotaStorage`, standalone-usable |
 | `tests/` | The entire test suite (see below) |
 
 **Do not introduce subpackages** (`internal/`, `core/`, `service/`, ...)
@@ -63,9 +68,19 @@ use `idx`'s exported API**. Concretely:
   `TestPool_RecalculateScoresAppliesQuotaPenalty`), rather than reaching for
   the unexported symbol directly.
 - Fakes (`fakeEthClient` implementing `EthClient`, `fakePool` implementing
-  `ProviderPool`, `fakeProviderHandle` implementing `RPCProvider`) already
-  exist in `tests/fakeethclient_test.go` and `tests/indexer_test.go` — reuse
-  them instead of writing new ones per file.
+  `ProviderPool`, `fakeProviderHandle` implementing `RPCProvider`,
+  `chainOnlyStorage`/`quotaOnlyStore` in `tests/storage_segregation_test.go`
+  proving the `ChainStorage`/`QuotaStorage` split is real) already exist —
+  reuse them instead of writing new ones per file.
+- `Memory`'s three pieces each get their own test file —
+  `tests/memorychain_test.go`, `tests/memoryscore_test.go`,
+  `tests/memoryquota_test.go` — constructing `NewMemoryChainStorage()` /
+  `NewMemoryScoreStorage()` / `NewMemoryQuotaStorage()` directly rather than
+  going through `NewMemory()`, so each piece is verified independently of
+  the other two. `tests/memory_test.go` itself only covers the composition
+  (that embedding wires up the full `Storage` correctly, and that using all
+  three together concurrently through one `Memory` value is safe) — put new
+  behavioral tests in the piece-specific file they belong to, not there.
 - If a test genuinely needs a new hook into internal behavior, consider
   whether that hook is legitimate public API (like `DialFunc` on
   `ProviderConfig`, added specifically so `Provider` is testable without a
@@ -99,7 +114,7 @@ invariant unless the user explicitly asks to change it:
   `GetQuotaRemaining()` (returns `remaining, used, ...`) — mixing them up
   makes the `used >= limit` check always false, silently disabling the
   penalty.
-- **`IndexerConfig.StartBlock` must apply on a fresh (empty) `Storage`.**
+- **`IndexerConfig.StartBlock` must apply on a fresh (empty) `ChainStorage`.**
   `syncBlocks` treats a persisted last-block of `0` as "nothing indexed
   yet" and substitutes `StartBlock - 1` so the first sync begins exactly at
   `StartBlock`, not block 1. Don't remove this without confirming the
@@ -108,14 +123,39 @@ invariant unless the user explicitly asks to change it:
   via the `WithOnExhausted(func(error))` callback (default: no-op), passing
   an error wrapping `ErrProviderPoolExhausted`. A library must not
   unilaterally kill the host process; that decision belongs to the caller.
-- **`ProviderPool`, `Storage`, `BlockchainEventDispatcher` are the only
+- **`ProviderPool`, `ChainStorage`, `BlockchainEventDispatcher` are the only
   things `Indexer` depends on** — never let it import or construct a
   concrete `Pool`/`Memory` internally. This is what keeps `Indexer` testable
   with fakes and reusable with any backend.
-- **No concrete SQL/Postgres storage in this repo.** `Storage` stays an
-  interface; `Memory` is the only implementation, deliberately non-durable.
-  If asked to add a real backend, it belongs in a separate package/repo, not
-  merged into this flat layout.
+- **Score/quota persistence is optional, detected via type assertion —
+  never make it a required part of `ChainStorage`.** `NewIndexer` and
+  `Pool.PersistQuotaUsage` deliberately take the narrowest interface they
+  need (`ChainStorage`, `QuotaStorage`), not the composite `Storage`. If
+  you add a new kind of persisted state, follow the same pattern: a new
+  small interface, checked with `storage.(NewInterface)` once at
+  construction (see `Indexer.scores`/`Indexer.quotas` in `indexer.go`), not
+  a new required method on `ChainStorage`. This is exactly what was fixed
+  here — `ChainStorage`/`ScoreStorage`/`QuotaStorage` used to be one
+  monolithic `Storage` interface forcing every implementer to stub out
+  score/quota methods it might not care about.
+- **No concrete SQL/Postgres storage in this repo.** `ChainStorage`/
+  `ScoreStorage`/`QuotaStorage` stay interfaces; `Memory` is the only
+  implementation, deliberately non-durable. If asked to add a real backend,
+  it belongs in a separate package/repo, not merged into this flat layout.
+- **`Memory` is a composition, not a monolith — keep it that way.**
+  `MemoryChainStorage`/`MemoryScoreStorage`/`MemoryQuotaStorage` are
+  separate types with separate locks, embedded into `Memory`. If you add a
+  new piece of persisted state, give it its own `Memory*Storage` type (own
+  file, own constructor, own lock) and embed it into `Memory` — don't grow
+  one of the existing three types to cover an unrelated concern.
+- **`PoolConfig.MaxLogBlockRange` is global, not per-provider.** RPC
+  providers used to each carry their own `MaxLogBlockRange`, and `Pool`
+  fell back to "the smallest configured value across providers" when picking
+  a chunk size — that complexity was deliberately removed. One value now
+  applies to every provider in the pool (default `DefaultMaxLogBlockRange`
+  = 1, i.e. no real batching until configured). Don't reintroduce a
+  per-provider override without being asked; if providers genuinely need
+  different limits, the caller should run separate `Pool`s.
 
 ## Before finishing any change
 

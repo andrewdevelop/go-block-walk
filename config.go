@@ -50,15 +50,14 @@ type QuotaConfig struct {
 
 // ProviderConfig describes a single upstream RPC endpoint.
 type ProviderConfig struct {
-	Name             string
-	URL              string
-	APIKey           string
-	Priority         int
-	MaxLogBlockRange int
-	Quota            QuotaConfig
-	RateLimit        RateLimitConfig
-	CircuitBreaker   CircuitBreakerConfig
-	Retry            RetryConfig
+	Name           string
+	URL            string
+	APIKey         string
+	Priority       int
+	Quota          QuotaConfig
+	RateLimit      RateLimitConfig
+	CircuitBreaker CircuitBreakerConfig
+	Retry          RetryConfig
 
 	// Dial optionally overrides how the provider establishes its RPC
 	// client. Defaults to dialing URL (+APIKey) over JSON-RPC via
@@ -73,11 +72,20 @@ type PoolConfig struct {
 	// UpdateInterval controls how often the pool recalculates provider
 	// health scores. Defaults to 30s if zero.
 	UpdateInterval time.Duration
+
+	// MaxLogBlockRange bounds how many blocks a single eth_getLogs call may
+	// span when the indexer batches a backfill, applied uniformly to every
+	// provider in the pool — RPC providers differ in what range they'll
+	// actually accept, so pick a value your least permissive provider
+	// supports. Must be a positive number of blocks; defaults to
+	// DefaultMaxLogBlockRange (1, i.e. no batching benefit) if zero or
+	// negative, so opting into real batching is a deliberate choice.
+	MaxLogBlockRange int
 }
 
 // IndexerConfig configures an Indexer's polling behaviour. It carries no
 // provider/storage wiring — those are supplied to NewIndexer directly as a
-// ProviderPool, a Storage and a BlockchainEventDispatcher, so any
+// ProviderPool, a ChainStorage and a BlockchainEventDispatcher, so any
 // implementation can be plugged in.
 type IndexerConfig struct {
 	Chain             string
