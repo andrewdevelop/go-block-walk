@@ -86,7 +86,8 @@ use `idx`'s exported API**. Concretely:
   `ProviderConfig`, added specifically so `Provider` is testable without a
   real RPC endpoint) before assuming the test can't be written.
 
-Run tests:
+Run tests (or use the Makefile — `make test`, `make test-race`, `make cover`,
+`make check`):
 
 ```sh
 go test ./...                              # everything
@@ -96,6 +97,18 @@ go test ./tests/... -coverpkg=./... -cover # coverage of the idx package (plain 
                                             # directory/package — coverage still needs -coverpkg to attribute
                                             # correctly)
 ```
+
+**One test is opt-in and excluded from all of the above**:
+`tests/hardhat_test.go` is gated behind `//go:build hardhat` and talks to a
+real JSON-RPC node (a locally running `npx hardhat node`, not started by the
+test itself) instead of a fake — it's the one place this repo verifies
+against real go-ethereum wire behavior rather than `fakeEthClient`. Run it
+with `make test-hardhat` (or `go test -tags hardhat ./tests/... -run
+TestHardhat -v`) — it requires a Hardhat node already listening on
+`HARDHAT_RPC_URL` (default `http://127.0.0.1:8545`) and skips (not fails) if
+none is reachable. Never remove the build tag or fold this test into the
+default suite — CI and every other contributor must be able to run
+`go test ./...` / `make test` without a Hardhat node available.
 
 ## Design invariants — do not casually change these
 
@@ -182,3 +195,6 @@ invariant unless the user explicitly asks to change it:
 5. If you touched anything storage- or pool-related, also run
    `go test ./tests/... -coverpkg=./... -cover` and sanity-check coverage
    didn't regress.
+6. `make check` runs 1–4 in one shot. If you have a Hardhat node running and
+   touched `Provider`/`Pool`/`Indexer` RPC plumbing, also run
+   `make test-hardhat-race`.

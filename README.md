@@ -302,6 +302,38 @@ go test ./tests/... -coverpkg=./... -cover       # coverage of the idx package i
 go test ./tests/... -run TestIntegration -v      # just the end-to-end pipeline test
 ```
 
+...or via the [Makefile](Makefile): `make test`, `make test-race`, `make cover`.
+
+### Opt-in: testing against a real Hardhat node
+
+[`tests/hardhat_test.go`](tests/hardhat_test.go) talks to an actual
+JSON-RPC node instead of a fake — real dial, real `eth_blockNumber` /
+`eth_getLogs` / etc. `TestHardhat_IndexerTracksRealChain` goes further than
+just watching the chain head move: it deploys a tiny contract whose init
+code unconditionally emits a log, then asserts the `Indexer`'s registered
+`BlockchainListener` actually received *that* log (matching `TxHash` and
+contract `Address`) — proof the full dispatch pipeline works against a real
+node, not just that polling advances. It's built only with `-tags hardhat`,
+so it's invisible to `go test ./...` and CI's default run, and skips (not
+fails) if no node is reachable — this is an opt-in, manual test, not
+something every contributor needs to run.
+
+Start a Hardhat node yourself first (this repo doesn't manage it):
+
+```sh
+npx hardhat node   # listens on :8545 by default
+```
+
+Then, in another terminal:
+
+```sh
+make test-hardhat        # HARDHAT_RPC_URL defaults to http://127.0.0.1:8545
+make test-hardhat-race   # same, with -race
+make test-all            # the fast suite + the Hardhat suite, both with -race
+```
+
+Point it at a different node with `HARDHAT_RPC_URL=http://host:port make test-hardhat`.
+
 ## Project layout
 
 ```
@@ -323,5 +355,7 @@ go test ./tests/... -run TestIntegration -v      # just the end-to-end pipeline 
 ├── memorychain.go     MemoryChainStorage (in-memory ChainStorage)
 ├── memoryscore.go     MemoryScoreStorage (in-memory ScoreStorage)
 ├── memoryquota.go     MemoryQuotaStorage (in-memory QuotaStorage)
+├── Makefile          build/test/cover/test-hardhat targets
 └── tests/            black-box test suite (package idx_test)
+    └── hardhat_test.go  opt-in, real-node test (build tag "hardhat")
 ```
