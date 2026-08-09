@@ -1,0 +1,387 @@
+package idx
+
+import (
+	"context"
+	"fmt"
+	"math/big"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+)
+
+const defaultPoolUpdateInterval = 30 * time.Second
+
+// Pool selects a healthy Provider for each call, biased towards whichever
+// provider currently has the best health score, and tracks success/failure
+// against whichever provider actually served the request. Safe for
+// concurrent use.
+type Pool struct {
+	mu          sync.RWMutex
+	providers   map[string]*Provider
+	orderedList []*Provider
+	penalties   map[string]float64
+
+	updateInterval time.Duration
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+}
+
+// NewPool dials every configured provider and starts a background loop that
+// periodically re-ranks them by health score. Call Close when done.
+func NewPool(cfg PoolConfig) *Pool {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	updateInterval := cfg.UpdateInterval
+	if updateInterval <= 0 {
+		updateInterval = defaultPoolUpdateInterval
+	}
+
+	pool := &Pool{
+		providers:      make(map[string]*Provider, len(cfg.Providers)),
+		orderedList:    make([]*Provider, 0, len(cfg.Providers)),
+		penalties:      make(map[string]float64),
+		updateInterval: updateInterval,
+		ctx:            ctx,
+		cancel:         cancel,
+	}
+
+	for _, pc := range cfg.Providers {
+		p := NewProvider(ctx, pc)
+		pool.providers[pc.Name] = p
+		pool.orderedList = append(pool.orderedList, p)
+	}
+
+	sort.Slice(pool.orderedList, func(i, j int) bool {
+		return pool.orderedList[i].Priority() < pool.orderedList[j].Priority()
+	})
+
+	pool.wg.Add(1)
+	go pool.updateLoop()
+
+	return pool
+}
+
+func (pool *Pool) updateLoop() {
+	defer pool.wg.Done()
+
+	ticker := time.NewTicker(pool.updateInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-pool.ctx.Done():
+			return
+		case <-ticker.C:
+			pool.recalculateScores()
+		}
+	}
+}
+
+func (pool *Pool) recalculateScores() {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	for _, p := range pool.orderedList {
+		limit, used, creditsLimit, creditsUsed := p.GetQuotaUsage()
+
+		penalty := 0.0
+		if limit > 0 && used >= limit {
+			penalty += 10
+		}
+		if creditsLimit > 0 && creditsUsed >= creditsLimit {
+			penalty += 5
+		}
+		pool.penalties[p.Name()] = penalty
+	}
+
+	sort.Slice(pool.orderedList, func(i, j int) bool {
+		return pool.adjustedScoreLocked(pool.orderedList[i]) > pool.adjustedScoreLocked(pool.orderedList[j])
+	})
+}
+
+// adjustedScoreLocked requires pool.mu to be held.
+func (pool *Pool) adjustedScoreLocked(p *Provider) float64 {
+	return p.Score() - pool.penalties[p.Name()]
+}
+
+func (pool *Pool) GetProvider() RPCProvider {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	for _, p := range pool.orderedList {
+		if p.IsAvailable() {
+			return p
+		}
+	}
+	return nil
+}
+
+func (pool *Pool) GetAllProviders() []RPCProvider {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	result := make([]RPCProvider, len(pool.orderedList))
+	for i, p := range pool.orderedList {
+		result[i] = p
+	}
+	return result
+}
+
+func (pool *Pool) RecordSuccess(provider RPCProvider) {
+	pool.mu.RLock()
+	p, ok := pool.providers[provider.Name()]
+	pool.mu.RUnlock()
+	if ok {
+		p.RecordSuccess()
+	}
+}
+
+func (pool *Pool) RecordFailure(provider RPCProvider, err error) {
+	pool.mu.RLock()
+	p, ok := pool.providers[provider.Name()]
+	pool.mu.RUnlock()
+	if ok {
+		p.RecordFailure(err)
+	}
+}
+
+// isLocalDecodeError reports whether err is caused by go-ethereum being
+// unable to decode a transaction type locally, rather than a provider-side
+// failure. These errors should not penalize the provider's health score.
+func isLocalDecodeError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "transaction type not supported")
+}
+
+func (pool *Pool) BlockByNumber(ctx context.Context, blockNum uint64) (*types.Block, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, ErrNoAvailableProvider
+	}
+
+	result, err := p.BlockByNumber(ctx, blockNum)
+	if err != nil {
+		if !isLocalDecodeError(err) {
+			pool.RecordFailure(p, err)
+		}
+		return nil, err
+	}
+
+	pool.RecordSuccess(p)
+	return result, nil
+}
+
+func (pool *Pool) BlockByHash(ctx context.Context, hash common.Hash) (*types.Block, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, ErrNoAvailableProvider
+	}
+
+	result, err := p.BlockByHash(ctx, hash)
+	if err != nil {
+		pool.RecordFailure(p, err)
+		return nil, err
+	}
+
+	pool.RecordSuccess(p)
+	return result, nil
+}
+
+func (pool *Pool) TransactionByHash(ctx context.Context, hash common.Hash) (*types.Transaction, bool, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, false, ErrNoAvailableProvider
+	}
+
+	result, isPending, err := p.TransactionByHash(ctx, hash)
+	if err != nil {
+		pool.RecordFailure(p, err)
+		return nil, false, err
+	}
+
+	pool.RecordSuccess(p)
+	return result, isPending, nil
+}
+
+func (pool *Pool) TransactionReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, ErrNoAvailableProvider
+	}
+
+	result, err := p.TransactionReceipt(ctx, hash)
+	if err != nil {
+		pool.RecordFailure(p, err)
+		return nil, err
+	}
+
+	pool.RecordSuccess(p)
+	return result, nil
+}
+
+func (pool *Pool) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, ErrNoAvailableProvider
+	}
+
+	result, err := p.FilterLogs(ctx, q)
+	if err != nil {
+		pool.RecordFailure(p, err)
+		return nil, err
+	}
+
+	pool.RecordSuccess(p)
+	return result, nil
+}
+
+func (pool *Pool) LogsByBlockNumber(ctx context.Context, blockNum uint64) ([]types.Log, error) {
+	return pool.FilterLogs(ctx, ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(blockNum),
+		ToBlock:   new(big.Int).SetUint64(blockNum),
+	})
+}
+
+// LogsByBlockRange fetches logs for [fromBlock, toBlock] in a single
+// eth_getLogs call. Callers doing a batched backfill are expected to size
+// the range using MaxLogBlockRange first — this does not split oversized
+// ranges itself.
+func (pool *Pool) LogsByBlockRange(ctx context.Context, fromBlock, toBlock uint64) ([]types.Log, error) {
+	return pool.FilterLogs(ctx, ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(fromBlock),
+		ToBlock:   new(big.Int).SetUint64(toBlock),
+	})
+}
+
+// MaxLogBlockRange returns the currently selected provider's max
+// eth_getLogs block range. If no provider is currently available, it falls
+// back to the smallest configured range across all providers (the safest
+// choice), or the package default if the pool has no providers at all.
+func (pool *Pool) MaxLogBlockRange() int {
+	if p := pool.GetProvider(); p != nil {
+		return p.MaxLogBlockRange()
+	}
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	min := 0
+	for _, p := range pool.orderedList {
+		if r := p.MaxLogBlockRange(); min == 0 || r < min {
+			min = r
+		}
+	}
+	if min == 0 {
+		min = DefaultMaxLogBlockRange
+	}
+	return min
+}
+
+func (pool *Pool) SubscribeNewHead(ctx context.Context, ch chan *types.Header) (ethereum.Subscription, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, ErrNoAvailableProvider
+	}
+	return p.SubscribeNewHead(ctx, ch)
+}
+
+func (pool *Pool) HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, ErrNoAvailableProvider
+	}
+
+	result, err := p.HeaderByNumber(ctx, number)
+	if err != nil {
+		pool.RecordFailure(p, err)
+		return nil, err
+	}
+
+	pool.RecordSuccess(p)
+	return result, nil
+}
+
+func (pool *Pool) BlockNumber(ctx context.Context) (uint64, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return 0, ErrNoAvailableProvider
+	}
+
+	result, err := p.BlockNumber(ctx)
+	if err != nil {
+		pool.RecordFailure(p, err)
+		return 0, err
+	}
+
+	pool.RecordSuccess(p)
+	return result, nil
+}
+
+func (pool *Pool) BalanceAt(ctx context.Context, address common.Address) (*big.Int, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, ErrNoAvailableProvider
+	}
+
+	result, err := p.BalanceAt(ctx, address)
+	if err != nil {
+		pool.RecordFailure(p, err)
+		return nil, err
+	}
+
+	pool.RecordSuccess(p)
+	return result, nil
+}
+
+// CodeAt does not record provider success/failure — it isn't on the
+// critical indexing path.
+func (pool *Pool) CodeAt(ctx context.Context, address common.Address) ([]byte, error) {
+	p := pool.GetProvider()
+	if p == nil {
+		return nil, ErrNoAvailableProvider
+	}
+	return p.CodeAt(ctx, address)
+}
+
+func (pool *Pool) Close() {
+	pool.cancel()
+	pool.wg.Wait()
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	for _, p := range pool.providers {
+		p.Close()
+	}
+}
+
+func (pool *Pool) GetScores() map[string]float64 {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	scores := make(map[string]float64, len(pool.providers))
+	for name, p := range pool.providers {
+		scores[name] = pool.adjustedScoreLocked(p)
+	}
+	return scores
+}
+
+func (pool *Pool) PersistQuotaUsage(ctx context.Context, storage Storage) error {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	for _, p := range pool.providers {
+		_, used, _, _ := p.GetQuotaUsage()
+		reqReset, _ := p.GetQuotaReset()
+		if err := storage.SetQuotaUsage(ctx, p.Name(), "requests", int(used), reqReset); err != nil {
+			return fmt.Errorf("persist quota for %s: %w", p.Name(), err)
+		}
+	}
+	return nil
+}
+
+var _ ProviderPool = (*Pool)(nil)

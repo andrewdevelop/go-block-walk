@@ -1,0 +1,21 @@
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Coverage output
+*.out
+coverage.txt
+
+# Go workspace files (local-only, per-developer)
+go.work
+go.work.sum
+
+# Editor / tool-specific local config
+.claude/
+.vscode/
+.idea/
+.DS_Store
