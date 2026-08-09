@@ -156,6 +156,22 @@ invariant unless the user explicitly asks to change it:
   = 1, i.e. no real batching until configured). Don't reintroduce a
   per-provider override without being asked; if providers genuinely need
   different limits, the caller should run separate `Pool`s.
+- **Sequential vs. batched sync is derived, not separately configured.**
+  `Indexer.syncBlocks` picks the path purely from
+  `idx.pool.MaxLogBlockRange()`: `== 1` → sequential (`syncBlocksSequential`,
+  one `HeaderByNumber`+`LogsByBlockNumber` per block), `> 1` → batched
+  (`syncBlocksBatched`, chunked `LogsByBlockRange`). There used to be a
+  separate `IndexerConfig.BatchLagThreshold` (switch to batching once the
+  chain lag exceeded some N) — removed as redundant: `PoolConfig` already
+  says how big a chunk the providers can take, so that's what decides
+  whether chunking is worth doing, not how far behind the indexer happens
+  to be on any given tick. Don't add a lag-based heuristic back; if you
+  need behavior to differ by how large the backlog is, that's a
+  `syncBlocksBatched`-internal concern (chunk sizing), not a path-selection
+  one. Note this makes the choice static for a `Pool`'s whole lifetime —
+  tests that want to exercise the sequential path need a `Pool`/fake with
+  `MaxLogBlockRange == 1` (the default), and a separate one with `> 1` for
+  the batched path; one `Pool` can't demonstrate both.
 
 ## Before finishing any change
 

@@ -164,16 +164,20 @@ func (l *persistingListener) Count() int {
 
 // TestIntegration_FullPipeline wires up real Pool + Provider + Memory +
 // Indexer + EventDispatcher (only the JSON-RPC transport is faked) and
-// drives them through a realistic lifecycle in five phases:
+// drives them through a realistic lifecycle in five phases. The pool is
+// configured with MaxLogBlockRange=4, so every sync in this test uses the
+// batched eth_getLogs path (PoolConfig.MaxLogBlockRange > 1) — the plain
+// sequential path (MaxLogBlockRange == 1, the default) is covered
+// separately in indexer_test.go.
 //
 //  1. Bootstrap: one provider is permanently down at dial time (higher
 //     priority, so failover must actually happen), the other is flaky —
 //     its first couple of calls fail transiently and must be recovered by
 //     the retry/backoff layer without surfacing an error.
-//  2. Sequential catch-up from a configured StartBlock on a small lag.
-//  3. A burst of new blocks pushes the lag over BatchLagThreshold,
-//     switching to the chunked eth_getLogs batch path (chunk size forced
-//     small so multiple chunks are exercised).
+//  2. Catch-up from a configured StartBlock on a small backlog that fits in
+//     a single eth_getLogs chunk.
+//  3. A burst of new blocks spans more than one chunk (chunk size 4),
+//     exercising the multi-chunk loop.
 //  4. Assert that provider health scores and quota usage were persisted to
 //     Storage as a side effect of normal syncing, and that every dispatched
 //     log was durably recorded exactly once.
@@ -237,7 +241,6 @@ func TestIntegration_FullPipeline(t *testing.T) {
 			Chain:                            chain,
 			StartBlock:                       3,
 			BlockInterval:                    5 * time.Millisecond,
-			BatchLagThreshold:                8,
 			MaxConsecutiveProviderExhaustion: 2,
 			ProviderExhaustionRestartDelay:   time.Millisecond,
 		},
@@ -259,8 +262,9 @@ func TestIntegration_FullPipeline(t *testing.T) {
 	}
 	defer indexer.Stop()
 
-	// --- Phase 2: sequential catch-up, blocks 3..5, with 2 transient
-	// header failures along the way that retry must absorb silently. ---
+	// --- Phase 2: catch-up over blocks 3..5 (one chunk, since the backlog
+	// is under MaxLogBlockRange=4), with 2 transient header failures along
+	// the way that retry must absorb silently. ---
 	flaky.setBlockNumber(5)
 	flaky.addLog(3, 0)
 	flaky.addLog(5, 0)
@@ -275,9 +279,9 @@ func TestIntegration_FullPipeline(t *testing.T) {
 		t.Fatalf("phase 2: expected 3 dispatched logs (blocks 3 and 5), got %d", got)
 	}
 
-	// --- Phase 3: a burst of 20 new blocks pushes lag (20) past
-	// BatchLagThreshold (8), forcing the chunked eth_getLogs path with
-	// MaxLogBlockRange=4 (5 chunks for blocks 6..25). ---
+	// --- Phase 3: a burst of 20 new blocks spans multiple chunks of the
+	// batched eth_getLogs path (MaxLogBlockRange=4 → 5 chunks for blocks
+	// 6..25). ---
 	flaky.setBlockNumber(25)
 	for b := uint64(6); b <= 25; b++ {
 		flaky.addLog(b, 0)

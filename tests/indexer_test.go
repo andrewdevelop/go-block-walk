@@ -35,12 +35,16 @@ type fakePool struct {
 	logsCalls        int
 }
 
+// newFakePool defaults maxRange to 1, mirroring PoolConfig.MaxLogBlockRange's
+// real default — so tests get the sequential sync path unless they
+// explicitly opt into batching by setting p.maxRange > 1 (see
+// TestIndexer_BatchesAcrossMultipleChunks).
 func newFakePool() *fakePool {
 	return &fakePool{
 		available:   true,
 		headers:     make(map[uint64]*types.Header),
 		logsByBlock: make(map[uint64][]types.Log),
-		maxRange:    10,
+		maxRange:    1,
 	}
 }
 
@@ -408,10 +412,10 @@ func TestIndexer_FreshStartUsesConfiguredStartBlock(t *testing.T) {
 	}
 }
 
-func TestIndexer_BatchesWhenLagExceedsThreshold(t *testing.T) {
+func TestIndexer_BatchesAcrossMultipleChunks(t *testing.T) {
 	pool := newFakePool()
 	pool.setBlockNumber(20)
-	pool.maxRange = 5
+	pool.maxRange = 5 // > 1 selects the batched path; 20 blocks / chunk size 5 = 4 chunks
 	for b := uint64(1); b <= 20; b++ {
 		pool.addLog(b, types.Log{Address: common.HexToAddress("0x1")})
 	}
@@ -419,8 +423,7 @@ func TestIndexer_BatchesWhenLagExceedsThreshold(t *testing.T) {
 	listener := &countingListener{}
 	store := NewMemory()
 	idx := newTestIndexer(t, IndexerConfig{
-		StartBlock:        0,
-		BatchLagThreshold: 5,
+		StartBlock: 0,
 	}, pool, store, NewEventDispatcher([]BlockchainListener{listener}))
 
 	if err := idx.Start(); err != nil {

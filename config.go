@@ -87,11 +87,15 @@ type PoolConfig struct {
 // provider/storage wiring — those are supplied to NewIndexer directly as a
 // ProviderPool, a ChainStorage and a BlockchainEventDispatcher, so any
 // implementation can be plugged in.
+//
+// Whether a sync uses the batched eth_getLogs path or the sequential,
+// one-block-at-a-time path isn't configured here — it's derived entirely
+// from PoolConfig.MaxLogBlockRange: 1 (the default) means sequential,
+// anything greater means batched.
 type IndexerConfig struct {
-	Chain             string
-	StartBlock        uint64
-	BlockInterval     time.Duration
-	BatchLagThreshold uint64
+	Chain         string
+	StartBlock    uint64
+	BlockInterval time.Duration
 
 	// MaxConsecutiveProviderExhaustion is how many consecutive sync attempts
 	// may find no available provider before OnExhausted (see WithOnExhausted)

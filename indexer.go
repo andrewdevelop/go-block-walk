@@ -255,11 +255,9 @@ func (idx *Indexer) syncBlocks() error {
 		startBlock = 1
 	}
 
-	lag := currentBlock - lastBlock
-
-	if idx.config.BatchLagThreshold > 0 && lag > idx.config.BatchLagThreshold {
-		idx.logger.Info("lag exceeds batch threshold, batching",
-			"lag", lag, "threshold", idx.config.BatchLagThreshold, "from", startBlock, "to", currentBlock)
+	if idx.pool.MaxLogBlockRange() > 1 {
+		idx.logger.Debug("processing blocks in batches",
+			"maxLogBlockRange", idx.pool.MaxLogBlockRange(), "from", startBlock, "to", currentBlock)
 		return idx.syncBlocksBatched(startBlock, currentBlock)
 	}
 

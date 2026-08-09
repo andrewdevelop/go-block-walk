@@ -29,9 +29,10 @@ import idx "github.com/andrewdevelop/go-block-walk"
 - **Quota tracking** — bounds requests and/or "compute unit" style credits
   (e.g. Alchemy) per provider within a rolling period.
 - **Indexer** (`Indexer`) — polls for new blocks on a timer or on demand
-  (`Nudge`), automatically switching between a low-latency sequential path
-  and a chunked `eth_getLogs` batch path once it falls behind by more than
-  `BatchLagThreshold` blocks.
+  (`Nudge`). Uses a low-latency, one-block-at-a-time sync path by default;
+  set `PoolConfig.MaxLogBlockRange > 1` and it switches to a chunked
+  `eth_getLogs` batch path instead — the same setting that bounds chunk
+  size also decides which path runs.
 - **Pluggable, segregated storage** — `ChainStorage` (sync progress +
   indexed events) is the only thing you need to implement to back the
   indexer with your own database. `ScoreStorage` and `QuotaStorage` (health
@@ -109,10 +110,9 @@ func main() {
 
 	indexer, err := idx.NewIndexer(
 		idx.IndexerConfig{
-			Chain:             "ethereum",
-			StartBlock:        18_000_000,
-			BlockInterval:     5 * time.Second,
-			BatchLagThreshold: 100,
+			Chain:         "ethereum",
+			StartBlock:    18_000_000,
+			BlockInterval: 5 * time.Second,
 		},
 		pool, storage, dispatcher,
 		idx.WithLogger(slog.Default()),
