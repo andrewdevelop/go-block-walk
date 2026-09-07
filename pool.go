@@ -302,10 +302,25 @@ func (pool *Pool) LogsByBlockRange(ctx context.Context, fromBlock, toBlock uint6
 	})
 }
 
-// MaxLogBlockRange returns the pool's configured eth_getLogs chunk size
-// (see PoolConfig.MaxLogBlockRange) — the same value for every provider in
-// the pool, resolved once at construction.
+// MaxLogBlockRange returns the eth_getLogs chunk size to use next: the
+// currently active provider's own limit (see ProviderConfig.MaxLogBlockRange)
+// if it has one, falling back to the pool-wide PoolConfig.MaxLogBlockRange
+// otherwise. Re-resolved on every call (Indexer.syncBlocksBatched calls it
+// once per chunk) so a higher-priority provider with a larger limit isn't
+// dragged down to whatever the smallest fallback provider in the pool
+// supports.
+//
+// Because GetProvider is also re-resolved independently on the actual
+// LogsByBlockRange call, the provider that ends up serving a chunk can
+// still differ from the one active when the chunk was sized (e.g. a
+// failover happening in between) — see isRangeTooLargeError and
+// Indexer.syncBlocksBatched for how that's recovered from.
 func (pool *Pool) MaxLogBlockRange() int {
+	if p := pool.GetProvider(); p != nil {
+		if r := p.MaxLogBlockRange(); r > 0 {
+			return r
+		}
+	}
 	return pool.maxLogBlockRange
 }
 

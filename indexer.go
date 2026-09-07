@@ -365,12 +365,28 @@ func (idx *Indexer) syncBlocksSequential(startBlock, currentBlock uint64) error 
 // their timestamp) are fetched once per distinct block that actually
 // produced logs, instead of once per block in the range. Progress is
 // persisted once per chunk rather than once per block.
+//
+// chunkSize starts at pool.MaxLogBlockRange() and is refreshed from the
+// pool at the start of each new chunk — so a failover to a smaller- or
+// larger-limit provider between chunks is picked up automatically. It is
+// NOT refreshed from the pool while retrying the same chunkStart after a
+// range-too-large split (the retrying flag below): the pool-wide/active-
+// provider value that produced the oversized request in the first place
+// would just undo the split and spin forever.
 func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
+	chunkSize := uint64(idx.pool.MaxLogBlockRange())
+	if chunkSize == 0 {
+		chunkSize = 1
+	}
+
+	retrying := false
 	for chunkStart := startBlock; chunkStart <= currentBlock; {
-		chunkSize := uint64(idx.pool.MaxLogBlockRange())
-		if chunkSize == 0 {
-			chunkSize = 1
+		if !retrying {
+			if poolLimit := uint64(idx.pool.MaxLogBlockRange()); poolLimit > 0 {
+				chunkSize = poolLimit
+			}
 		}
+		retrying = false
 
 		chunkEnd := chunkStart + chunkSize - 1
 		if chunkEnd > currentBlock {
@@ -381,6 +397,21 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 
 		logs, err := idx.pool.LogsByBlockRange(idx.ctx, chunkStart, chunkEnd)
 		if err != nil {
+			if isRangeTooLargeError(err) && chunkEnd > chunkStart {
+				// The provider that ended up serving this particular
+				// request (GetProvider is re-resolved independently by the
+				// pool on every call) has a smaller limit than whatever
+				// chunkSize was computed from. Split the range instead of
+				// failing the whole sync, and retry the same chunkStart.
+				chunkSize = (chunkEnd - chunkStart + 1) / 2
+				if chunkSize == 0 {
+					chunkSize = 1
+				}
+				retrying = true
+				idx.logger.Warn("log range rejected as too large by serving provider, splitting chunk and retrying",
+					"from", chunkStart, "to", chunkEnd, "newChunkSize", chunkSize, "error", err)
+				continue
+			}
 			return fmt.Errorf("failed to get logs for blocks %d..%d: %w", chunkStart, chunkEnd, err)
 		}
 

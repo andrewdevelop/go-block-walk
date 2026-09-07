@@ -16,15 +16,16 @@ import (
 // circuit breaking, retries, quota tracking and a health score. Safe for
 // concurrent use.
 type Provider struct {
-	name           string
-	priority       int
-	client         EthClient
-	dialErr        error
-	limiter        *RateLimiter
-	circuitBreaker *CircuitBreaker
-	quota          *QuotaManager
-	retryCfg       RetryConfig
-	requestTimeout time.Duration
+	name             string
+	priority         int
+	client           EthClient
+	dialErr          error
+	limiter          *RateLimiter
+	circuitBreaker   *CircuitBreaker
+	quota            *QuotaManager
+	retryCfg         RetryConfig
+	requestTimeout   time.Duration
+	maxLogBlockRange int
 
 	mu           sync.RWMutex
 	healthy      bool
@@ -53,24 +54,30 @@ func NewProvider(ctx context.Context, cfg ProviderConfig) *Provider {
 	client, err := dial(ctx, url)
 
 	return &Provider{
-		name:           cfg.Name,
-		priority:       cfg.Priority,
-		client:         client,
-		dialErr:        err,
-		limiter:        NewRateLimiter(cfg.RateLimit),
-		circuitBreaker: NewCircuitBreaker(cfg.CircuitBreaker),
-		quota:          newQuotaManager(cfg.Quota),
-		retryCfg:       cfg.Retry,
-		requestTimeout: cfg.RequestTimeout,
-		healthy:        err == nil && client != nil,
-		baseScore:      float64(cfg.Priority),
-		currentScore:   float64(cfg.Priority),
+		name:             cfg.Name,
+		priority:         cfg.Priority,
+		client:           client,
+		dialErr:          err,
+		limiter:          NewRateLimiter(cfg.RateLimit),
+		circuitBreaker:   NewCircuitBreaker(cfg.CircuitBreaker),
+		quota:            newQuotaManager(cfg.Quota),
+		retryCfg:         cfg.Retry,
+		requestTimeout:   cfg.RequestTimeout,
+		maxLogBlockRange: cfg.MaxLogBlockRange,
+		healthy:          err == nil && client != nil,
+		baseScore:        float64(cfg.Priority),
+		currentScore:     float64(cfg.Priority),
 	}
 }
 
 func (p *Provider) Name() string           { return p.name }
 func (p *Provider) Priority() int          { return p.priority }
 func (p *Provider) SetScore(score float64) { p.mu.Lock(); defer p.mu.Unlock(); p.currentScore = score }
+
+// MaxLogBlockRange returns this provider's own eth_getLogs range limit (see
+// ProviderConfig.MaxLogBlockRange), or 0 if it doesn't override the
+// pool-wide default. Immutable after construction, so no locking is needed.
+func (p *Provider) MaxLogBlockRange() int { return p.maxLogBlockRange }
 
 func (p *Provider) Score() float64 {
 	p.mu.RLock()

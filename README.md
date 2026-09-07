@@ -38,9 +38,14 @@ import idx "github.com/andrewdevelop/go-block-walk"
   just the first try).
 - **Indexer** (`Indexer`) — polls for new blocks on a timer or on demand
   (`Nudge`). Uses a low-latency, one-block-at-a-time sync path by default;
-  set `PoolConfig.MaxLogBlockRange > 1` and it switches to a chunked
+  set `PoolConfig.MaxLogBlockRange > 1` (or give a provider its own
+  `ProviderConfig.MaxLogBlockRange`) and it switches to a chunked
   `eth_getLogs` batch path instead — the same setting that bounds chunk
-  size also decides which path runs. A block's logs are only ever marked
+  size also decides which path runs. Chunk size tracks whichever provider
+  is currently serving requests, so a higher-priority provider with a much
+  larger range limit isn't dragged down to a weaker fallback provider's
+  limit; see [`PoolConfig`](#poolconfig--the-provider-pool) for how the
+  two levels combine, and mid-chunk failover recovery. A block's logs are only ever marked
   processed once its header, logs and dispatch all succeed — a transient
   RPC or listener error halts progress at that block instead of silently
   skipping it, so the next tick retries it (at-least-once delivery; keep
@@ -99,9 +104,10 @@ func (myListener) HandleLog(l types.Log, blockTimestamp uint64) error {
 
 func main() {
 	pool, err := idx.NewPool(idx.PoolConfig{
-		// How many blocks a single eth_getLogs call may span when the
-		// indexer batches a backfill, applied to every provider below.
-		// Defaults to 1 (no real batching) if left unset.
+		// Pool-wide default: how many blocks a single eth_getLogs call may
+		// span when the indexer batches a backfill, used for any provider
+		// below that doesn't set its own MaxLogBlockRange. Defaults to 1
+		// (no real batching) if left unset.
 		MaxLogBlockRange: 2000,
 		Providers: []idx.ProviderConfig{
 			{
@@ -114,12 +120,18 @@ func main() {
 				},
 				Retry:          idx.RetryConfig{MaxAttempts: 3, BaseDelay: 200 * time.Millisecond, MaxDelay: 2 * time.Second, Jitter: true},
 				RequestTimeout: 10 * time.Second,
+				// This provider's tier accepts a much wider eth_getLogs
+				// range than the pool-wide default above — override it so
+				// batching isn't dragged down to what "fallback" supports.
+				MaxLogBlockRange: 10000,
 			},
 			{
 				Name:           "fallback",
 				URL:            "https://eth-mainnet.fallback.example.com",
 				Priority:       2,
 				RequestTimeout: 10 * time.Second,
+				// No override: falls back to the pool-wide MaxLogBlockRange
+				// (2000) above whenever this provider is the active one.
 			},
 		},
 	})
@@ -195,11 +207,18 @@ flowchart TD
   number preferred) is always the primary sort key, exactly matching the
   order at construction; health score only breaks ties between
   same-priority providers. `GetProvider` then routes each call to the
-  first currently-available one in that order. `Pool` also owns
-  `PoolConfig.MaxLogBlockRange` — one eth_getLogs chunk size applied
-  uniformly to every provider (default 1); there's no per-provider
-  override. `NewPool` validates its config and returns `(*Pool, error)`;
-  `Close` is idempotent.
+  first currently-available one in that order. `Pool.MaxLogBlockRange()`
+  returns the *currently active* provider's own `ProviderConfig.MaxLogBlockRange`
+  if it set one, falling back to the pool-wide `PoolConfig.MaxLogBlockRange`
+  (default 1) otherwise — re-resolved on every call, so it tracks failover
+  between providers with different limits instead of being pinned to
+  whichever value was computed at construction. Because the provider that
+  ends up serving a given `eth_getLogs` call is itself resolved
+  independently (per call, not per chunk), `Indexer`'s batched sync path
+  also handles a provider-with-a-smaller-limit rejecting an
+  already-in-flight chunk as "range too large": it splits that chunk in
+  half and retries instead of failing the whole sync. `NewPool` validates
+  its config and returns `(*Pool, error)`; `Close` is idempotent.
 - **`Indexer`** depends only on the `ProviderPool`, `ChainStorage` and
   `BlockchainEventDispatcher` interfaces — never on `Pool`/`Memory`
   directly — so you can inject fakes in your own tests exactly like this
@@ -233,6 +252,7 @@ Passed as `PoolConfig.Providers[i]`, one per URL.
 | `Retry`          | `RetryConfig`          | 1 attempt, no backoff               | Retry/backoff loop around each call.                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `Quota`          | `QuotaConfig`          | unlimited                           | Rolling request/credit budget.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `RequestTimeout` | `time.Duration`        | disabled (`0`)                      | Bounds a *single physical attempt* via `context.WithTimeout` — a short timeout doesn't starve later retries, since it's applied fresh per attempt, not once for the whole retry loop. Go-ethereum's `ethclient` has no built-in per-request timeout, so without this a stuck upstream (e.g. a dropped TCP packet with no RST) hangs the call until the caller's own context is cancelled — which may be never. **Not** applied to `SubscribeNewHead` (a long-lived subscription, not a request/response call). |
+| `MaxLogBlockRange` | `int`                | `0` (defer to pool-wide)             | Overrides `PoolConfig.MaxLogBlockRange` for this one provider — set it when a provider's own `eth_getLogs` range limit differs from the rest of the pool (e.g. a higher-tier provider that accepts a much larger range). `0` means "no override": `Pool.MaxLogBlockRange()` falls back to the pool-wide value whenever this provider is the one currently active.                                                                                                                                          |
 
 A dial failure at construction doesn't fail `NewProvider`/`NewPool` — the
 provider is simply marked unavailable (`IsAvailable() == false`) and the
@@ -328,7 +348,7 @@ backends](#custom-storage-backends).
 |--------------------|--------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `Providers`        | `[]ProviderConfig` | —       | **Required, at least one.** `NewPool` returns an error for an empty list or a duplicate/empty `Name`.                                                                                                  |
 | `UpdateInterval`   | `time.Duration`    | `30s`   | How often `Pool` re-ranks providers by health score/quota penalty.                                                                                                                                     |
-| `MaxLogBlockRange` | `int`              | `1`     | eth_getLogs chunk size, applied uniformly to every provider — also what decides whether `Indexer` uses the sequential or batched sync path (`> 1` → batched). Zero or negative also falls back to `1`. |
+| `MaxLogBlockRange` | `int`              | `1`     | Pool-wide default eth_getLogs chunk size, used for any provider that doesn't set its own `ProviderConfig.MaxLogBlockRange` — also what decides whether `Indexer` uses the sequential or batched sync path (`Pool.MaxLogBlockRange() > 1` → batched). Zero or negative also falls back to `1`. |
 
 Ranking is **`Priority` ascending first, health score descending only to
 break ties** between providers that share the same `Priority` — a

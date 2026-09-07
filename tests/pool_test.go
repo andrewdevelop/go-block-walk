@@ -144,7 +144,7 @@ func TestPool_MaxLogBlockRangeDefaultsToOne(t *testing.T) {
 	}
 }
 
-func TestPool_MaxLogBlockRangeAppliesGloballyToAllProviders(t *testing.T) {
+func TestPool_MaxLogBlockRangeFallsBackToPoolWideValue(t *testing.T) {
 	pool := mustNewPool(t, PoolConfig{
 		MaxLogBlockRange: 777,
 		Providers: []ProviderConfig{
@@ -154,11 +154,60 @@ func TestPool_MaxLogBlockRangeAppliesGloballyToAllProviders(t *testing.T) {
 	})
 	defer pool.Close()
 
-	// The configured value applies uniformly, regardless of which provider
-	// (if any) is currently selected — there's no more per-provider value
-	// to fall back on.
+	// Neither provider sets its own MaxLogBlockRange, so the pool-wide
+	// value applies regardless of which one is currently selected.
 	if got := pool.MaxLogBlockRange(); got != 777 {
 		t.Fatalf("expected 777, got %d", got)
+	}
+}
+
+func TestPool_MaxLogBlockRangeUsesActiveProvidersOwnLimit(t *testing.T) {
+	highLimit := poolProviderConfig("high-limit", 1, newFakeEthClient())
+	highLimit.MaxLogBlockRange = 10000
+
+	lowLimit := poolProviderConfig("low-limit", 2, newFakeEthClient())
+	lowLimit.MaxLogBlockRange = 10
+
+	pool := mustNewPool(t, PoolConfig{
+		MaxLogBlockRange: 1,
+		Providers:        []ProviderConfig{highLimit, lowLimit},
+	})
+	defer pool.Close()
+
+	// "high-limit" is priority 1 and healthy, so its own (larger) limit
+	// wins over both the lower-priority provider's limit and the pool-wide
+	// fallback — a smaller fallback provider must not drag it down.
+	if got := pool.MaxLogBlockRange(); got != 10000 {
+		t.Fatalf("expected the active provider's own limit 10000, got %d", got)
+	}
+}
+
+func TestPool_MaxLogBlockRangeTracksFailover(t *testing.T) {
+	highLimit := poolProviderConfig("high-limit", 1, newFakeEthClient())
+	highLimit.MaxLogBlockRange = 10000
+
+	lowLimit := poolProviderConfig("low-limit", 2, newFakeEthClient())
+	lowLimit.MaxLogBlockRange = 10
+
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{highLimit, lowLimit}})
+	defer pool.Close()
+
+	if got := pool.MaxLogBlockRange(); got != 10000 {
+		t.Fatalf("expected 10000 while high-limit is active, got %d", got)
+	}
+
+	// Drive high-limit's score below the unhealthy threshold so the pool
+	// fails over to low-limit.
+	p := pool.GetProvider()
+	for i := 0; i < 20; i++ {
+		pool.RecordFailure(p, errors.New("boom"))
+	}
+
+	if got := pool.GetProvider(); got == nil || got.Name() != "low-limit" {
+		t.Fatalf("expected pool to have failed over to low-limit, got %v", got)
+	}
+	if got := pool.MaxLogBlockRange(); got != 10 {
+		t.Fatalf("expected 10 once failed over to low-limit, got %d", got)
 	}
 }
 

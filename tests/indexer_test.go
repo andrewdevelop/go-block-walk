@@ -3,6 +3,7 @@ package idx_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"sync"
@@ -30,6 +31,12 @@ type fakePool struct {
 	logsByBlock    map[uint64][]types.Log
 	logsErr        error
 	maxRange       int
+
+	// maxAcceptedRange, if non-zero, makes FilterLogs reject any query
+	// spanning more blocks than this with a "range too large" error —
+	// simulating a request that ends up served by a provider with a
+	// smaller limit than the one syncBlocksBatched sized the chunk for.
+	maxAcceptedRange int
 
 	blockNumberCalls int
 	logsCalls        int
@@ -89,6 +96,9 @@ func (p *fakePool) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]ty
 
 	from := q.FromBlock.Uint64()
 	to := q.ToBlock.Uint64()
+	if p.maxAcceptedRange > 0 && to-from+1 > uint64(p.maxAcceptedRange) {
+		return nil, fmt.Errorf("range too large: max %d blocks", p.maxAcceptedRange)
+	}
 	var out []types.Log
 	for b := from; b <= to; b++ {
 		out = append(out, p.logsByBlock[b]...)
@@ -188,14 +198,15 @@ func (p *fakePool) callCounts() (blockNumberCalls, logsCalls int) {
 // fakeProviderHandle is a stand-in RPCProvider returned by fakePool.GetProvider.
 type fakeProviderHandle struct{ name string }
 
-func (h *fakeProviderHandle) Name() string        { return h.name }
-func (h *fakeProviderHandle) Priority() int       { return 0 }
-func (h *fakeProviderHandle) Score() float64      { return 1 }
-func (h *fakeProviderHandle) SetScore(float64)    {}
-func (h *fakeProviderHandle) IsAvailable() bool   { return true }
-func (h *fakeProviderHandle) RecordSuccess()      {}
-func (h *fakeProviderHandle) RecordFailure(error) {}
-func (h *fakeProviderHandle) Close()              {}
+func (h *fakeProviderHandle) Name() string          { return h.name }
+func (h *fakeProviderHandle) Priority() int         { return 0 }
+func (h *fakeProviderHandle) Score() float64        { return 1 }
+func (h *fakeProviderHandle) SetScore(float64)      {}
+func (h *fakeProviderHandle) IsAvailable() bool     { return true }
+func (h *fakeProviderHandle) MaxLogBlockRange() int { return 0 }
+func (h *fakeProviderHandle) RecordSuccess()        {}
+func (h *fakeProviderHandle) RecordFailure(error)   {}
+func (h *fakeProviderHandle) Close()                {}
 func (h *fakeProviderHandle) BlockByNumber(ctx context.Context, blockNum uint64) (*types.Block, error) {
 	return nil, errNotImplemented
 }
@@ -452,6 +463,40 @@ func TestIndexer_BatchesAcrossMultipleChunks(t *testing.T) {
 	}
 	if _, logsCalls := pool.callCounts(); logsCalls == 0 {
 		t.Fatal("expected the batched path to call FilterLogs")
+	}
+}
+
+func TestIndexer_BatchedSyncSplitsChunkOnRangeTooLargeError(t *testing.T) {
+	pool := newFakePool()
+	pool.setBlockNumber(20)
+	pool.maxRange = 20        // chunk sized for a high-limit provider...
+	pool.maxAcceptedRange = 5 // ...but the request actually lands on one with a smaller limit
+	for b := uint64(1); b <= 20; b++ {
+		pool.addLog(b, types.Log{Address: common.HexToAddress("0x1")})
+	}
+
+	listener := &countingListener{}
+	store := NewMemory()
+	idx := newTestIndexer(t, IndexerConfig{
+		StartBlock: 0,
+	}, pool, store, NewEventDispatcher([]BlockchainListener{listener}))
+
+	if err := idx.Start(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer idx.Stop()
+	idx.Nudge()
+
+	waitFor(t, time.Second, func() bool {
+		last, _ := idx.GetLastBlock()
+		return last == 20
+	})
+
+	if got := listener.count(); got != 20 {
+		t.Fatalf("expected all 20 logs to still be dispatched despite the oversized first attempt, got %d", got)
+	}
+	if _, logsCalls := pool.callCounts(); logsCalls <= 4 {
+		t.Fatalf("expected more than the 4 chunks a clean 20/5 split would need, since the initial 20-block chunk had to be rejected and split first, got %d calls", logsCalls)
 	}
 }
 

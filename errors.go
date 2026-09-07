@@ -22,6 +22,32 @@ func isLocalDecodeError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "transaction type not supported")
 }
 
+// isRangeTooLargeError reports whether err indicates the RPC provider that
+// served an eth_getLogs call rejected it because the requested block range
+// exceeded what that specific provider allows (wording varies: "range too
+// large", "block range exceeds ...", "range limit exceeded", "too many
+// blocks in range", ...). This can happen even when the caller sized the
+// chunk from Pool.MaxLogBlockRange, because the provider that actually ends
+// up serving the request is resolved independently (and can differ, e.g.
+// under a failover racing the chunk-sizing call) — see
+// Indexer.syncBlocksBatched, which reacts to this by splitting the chunk
+// and retrying instead of failing the whole sync.
+func isRangeTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if !strings.Contains(s, "range") {
+		return false
+	}
+	for _, kw := range []string{"large", "limit", "exceed", "too many"} {
+		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // ErrAlreadyRunning is returned by Indexer.Start if the indexer is already running.
 var ErrAlreadyRunning = errors.New("idx: indexer already running")
 

@@ -73,6 +73,14 @@ type ProviderConfig struct {
 	// client. Defaults to dialing URL (+APIKey) over JSON-RPC via
 	// go-ethereum's ethclient. Tests inject a fake EthClient through this.
 	Dial DialFunc
+
+	// MaxLogBlockRange overrides PoolConfig.MaxLogBlockRange for this one
+	// provider — set it when a provider's own eth_getLogs range limit
+	// differs from the rest of the pool (e.g. a higher-tier provider that
+	// accepts a much larger range than the others). Zero (the default)
+	// means "no override": Pool.MaxLogBlockRange falls back to the
+	// pool-wide value whenever this provider is the one currently active.
+	MaxLogBlockRange int
 }
 
 // PoolConfig configures a Pool of providers.
@@ -84,12 +92,14 @@ type PoolConfig struct {
 	UpdateInterval time.Duration
 
 	// MaxLogBlockRange bounds how many blocks a single eth_getLogs call may
-	// span when the indexer batches a backfill, applied uniformly to every
-	// provider in the pool — RPC providers differ in what range they'll
-	// actually accept, so pick a value your least permissive provider
-	// supports. Must be a positive number of blocks; defaults to
-	// DefaultMaxLogBlockRange (1, i.e. no batching benefit) if zero or
-	// negative, so opting into real batching is a deliberate choice.
+	// span when the indexer batches a backfill. It's the pool-wide default,
+	// used for any provider that doesn't set its own
+	// ProviderConfig.MaxLogBlockRange — see that field to give a specific
+	// provider a different limit (e.g. a higher-tier provider that accepts
+	// a much larger range than the rest of the pool). Must be a positive
+	// number of blocks; defaults to DefaultMaxLogBlockRange (1, i.e. no
+	// batching benefit) if zero or negative, so opting into real batching
+	// is a deliberate choice.
 	MaxLogBlockRange int
 }
 
