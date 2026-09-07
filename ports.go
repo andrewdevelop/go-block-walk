@@ -46,6 +46,11 @@ type RPCProvider interface {
 	RecordFailure(err error)
 	Close()
 
+	// MaxLogBlockRange returns this provider's own eth_getLogs range limit,
+	// or 0 to defer to the pool-wide PoolConfig.MaxLogBlockRange. See
+	// ProviderConfig.MaxLogBlockRange and Pool.MaxLogBlockRange.
+	MaxLogBlockRange() int
+
 	BlockByNumber(ctx context.Context, blockNum uint64) (*types.Block, error)
 	BlockByHash(ctx context.Context, hash common.Hash) (*types.Block, error)
 	TransactionByHash(ctx context.Context, hash common.Hash) (*types.Transaction, bool, error)
