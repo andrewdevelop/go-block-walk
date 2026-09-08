@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -31,12 +32,13 @@ type Pool struct {
 	orderedList []*Provider
 	penalties   map[string]float64
 
-	updateInterval   time.Duration
-	maxLogBlockRange int
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
-	closeOnce        sync.Once
+	updateInterval         time.Duration
+	maxLogBlockRange       int
+	maxParallelJobAttempts int
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	wg                     sync.WaitGroup
+	closeOnce              sync.Once
 }
 
 // NewPool dials every configured provider and starts a background loop that
@@ -70,13 +72,14 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 	}
 
 	pool := &Pool{
-		providers:        make(map[string]*Provider, len(cfg.Providers)),
-		orderedList:      make([]*Provider, 0, len(cfg.Providers)),
-		penalties:        make(map[string]float64),
-		updateInterval:   updateInterval,
-		maxLogBlockRange: maxLogBlockRange,
-		ctx:              ctx,
-		cancel:           cancel,
+		providers:              make(map[string]*Provider, len(cfg.Providers)),
+		orderedList:            make([]*Provider, 0, len(cfg.Providers)),
+		penalties:              make(map[string]float64),
+		updateInterval:         updateInterval,
+		maxLogBlockRange:       maxLogBlockRange,
+		maxParallelJobAttempts: cfg.MaxParallelJobAttempts,
+		ctx:                    ctx,
+		cancel:                 cancel,
 	}
 
 	for _, pc := range cfg.Providers {
@@ -324,6 +327,252 @@ func (pool *Pool) MaxLogBlockRange() int {
 	return pool.maxLogBlockRange
 }
 
+// parallelJobAttemptLimit bounds how many times a single sub-range job may
+// be retried (against any provider, not just the one that first failed it)
+// during a parallel backfill round before LogsByBlockRangeParallel gives up
+// on it and fails the whole round. Without a cap, a sub-range that every
+// provider rejects for a reason that doesn't trip the circuit breaker or
+// exhaust quota (so IsAvailable keeps reporting the provider as fine) would
+// bounce between providers forever.
+//
+// Defaults to twice the number of providers taking part in this round (so
+// every provider gets, on average, two independent chances at any given
+// job before it's abandoned) unless PoolConfig.MaxParallelJobAttempts
+// overrides it. available is guaranteed >= 2 by LogsByBlockRangeParallel's
+// only caller of this, so the default is always at least 4.
+func (pool *Pool) parallelJobAttemptLimit(available int) int {
+	if pool.maxParallelJobAttempts > 0 {
+		return pool.maxParallelJobAttempts
+	}
+	return available * 2
+}
+
+// availableProvidersSnapshot returns the currently available providers, in
+// the pool's existing priority/score order, as concrete *Provider so
+// LogsByBlockRangeParallel can call FilterLogs on a specific one directly
+// (Pool's other methods always go through GetProvider, i.e. only ever the
+// single top-ranked provider).
+func (pool *Pool) availableProvidersSnapshot() []*Provider {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	out := make([]*Provider, 0, len(pool.orderedList))
+	for _, p := range pool.orderedList {
+		if p.IsAvailable() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// effectiveMaxLogBlockRangeLocked returns p's own eth_getLogs range limit,
+// falling back to the pool-wide default — the same resolution
+// Pool.MaxLogBlockRange applies to the single active provider, generalised
+// to any provider. Does not require pool.mu (maxLogBlockRange is immutable
+// after NewPool); named "Locked" only for symmetry with its one caller.
+func (pool *Pool) effectiveMaxLogBlockRange(p *Provider) int {
+	if r := p.MaxLogBlockRange(); r > 0 {
+		return r
+	}
+	return pool.maxLogBlockRange
+}
+
+// ParallelLogPlan implements ParallelBackfiller.
+func (pool *Pool) ParallelLogPlan() (providers int, chunkSize int) {
+	available := pool.availableProvidersSnapshot()
+	if len(available) == 0 {
+		return 0, 0
+	}
+
+	smallest := 0
+	for _, p := range available {
+		limit := pool.effectiveMaxLogBlockRange(p)
+		if limit <= 0 {
+			limit = 1
+		}
+		if smallest == 0 || limit < smallest {
+			smallest = limit
+		}
+	}
+	return len(available), smallest
+}
+
+type parallelLogJob struct {
+	index    int
+	from, to uint64
+	attempts int
+}
+
+// LogsByBlockRangeParallel implements ParallelBackfiller. See that
+// interface's doc for the external contract; the approach here is a
+// worker-per-available-provider pool pulling sub-range jobs off a shared
+// queue: a job that fails gets pushed back onto the queue for a different
+// (or, if it later recovers, the same) provider to pick up, and a worker
+// exits once its own provider stops being available, shrinking the pool of
+// active workers. The round only completes once every job has succeeded
+// (results assembled back in ascending sub-range order) or fails outright
+// once no worker remains to make progress.
+//
+// The set of workers is fixed to the availableProvidersSnapshot taken at
+// the top of this call: a provider that was down at that point and comes
+// back up before the round finishes does NOT get a worker spun up for it
+// mid-round — it only rejoins on the *next* call, once
+// Indexer.syncBlocksBatched re-queries ParallelLogPlan for the next chunk.
+// This is deliberate, not an oversight: a round only ever spans
+// chunkSize*len(available) blocks, so the window where a recovered
+// provider sits idle is short-lived and self-corrects on the very next
+// round: polling provider health mid-round and growing the worker pool on
+// the fly isn't worth the added complexity for that small a window.
+func (pool *Pool) LogsByBlockRangeParallel(ctx context.Context, fromBlock, toBlock uint64) ([]types.Log, error) {
+	if toBlock < fromBlock {
+		return nil, nil
+	}
+
+	available := pool.availableProvidersSnapshot()
+	if len(available) == 0 {
+		return nil, ErrNoAvailableProvider
+	}
+
+	chunkSize := uint64(1)
+	for _, p := range available {
+		if limit := uint64(pool.effectiveMaxLogBlockRange(p)); limit > 0 && (chunkSize == 1 || limit < chunkSize) {
+			chunkSize = limit
+		}
+	}
+
+	totalBlocks := toBlock - fromBlock + 1
+	if len(available) < 2 || totalBlocks <= chunkSize {
+		// Not enough spare providers, or not enough backlog to give more than
+		// one of them meaningful work — a plain single-provider fetch (which
+		// already knows how to recover from a too-large range) covers this
+		// just as well with none of the fan-out bookkeeping.
+		return pool.LogsByBlockRange(ctx, fromBlock, toBlock)
+	}
+
+	var jobs []parallelLogJob
+	for start, i := fromBlock, 0; start <= toBlock; i++ {
+		end := start + chunkSize - 1
+		if end > toBlock {
+			end = toBlock
+		}
+		jobs = append(jobs, parallelLogJob{index: i, from: start, to: end})
+		start = end + 1
+	}
+
+	results := make([][]types.Log, len(jobs))
+	jobCh := make(chan parallelLogJob, len(jobs))
+	for _, j := range jobs {
+		jobCh <- j
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	attemptLimit := pool.parallelJobAttemptLimit(len(available))
+
+	var (
+		mu       sync.Mutex
+		firstErr error
+	)
+	remaining := int32(len(jobs))
+	active := int32(len(available))
+
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+		cancel()
+	}
+
+	var wg sync.WaitGroup
+	for _, p := range available {
+		wg.Add(1)
+		go func(p *Provider) {
+			defer wg.Done()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case job, ok := <-jobCh:
+					if !ok {
+						return
+					}
+
+					logs, err := p.FilterLogs(runCtx, ethereum.FilterQuery{
+						FromBlock: new(big.Int).SetUint64(job.from),
+						ToBlock:   new(big.Int).SetUint64(job.to),
+					})
+					if err != nil {
+						pool.RecordFailure(p, err)
+
+						if isRangeTooLargeError(err) {
+							// Sizing already used the smallest available
+							// provider's limit, so this means the provider
+							// that actually served it (resolved independently
+							// of the sizing snapshot) has an even smaller one
+							// — bail out to the caller's own chunk-splitting
+							// recovery rather than spinning sub-ranges that
+							// keep coming back too large.
+							fail(fmt.Errorf("idx: parallel backfill chunk %d..%d rejected as too large: %w", job.from, job.to, err))
+							return
+						}
+
+						job.attempts++
+						if job.attempts >= attemptLimit {
+							fail(fmt.Errorf("idx: parallel backfill chunk %d..%d failed after %d attempts: %w", job.from, job.to, job.attempts, err))
+							return
+						}
+
+						select {
+						case jobCh <- job:
+						case <-runCtx.Done():
+							return
+						}
+
+						if !p.IsAvailable() {
+							if atomic.AddInt32(&active, -1) == 0 {
+								fail(fmt.Errorf("idx: parallel backfill exhausted every provider before finishing: %w", err))
+							}
+							return
+						}
+						continue
+					}
+
+					pool.RecordSuccess(p)
+					mu.Lock()
+					results[job.index] = logs
+					mu.Unlock()
+
+					if atomic.AddInt32(&remaining, -1) == 0 {
+						cancel()
+						return
+					}
+				}
+			}
+		}(p)
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if remaining != 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("idx: parallel backfill of %d..%d aborted before completion", fromBlock, toBlock)
+	}
+
+	out := make([]types.Log, 0, totalBlocks)
+	for _, r := range results {
+		out = append(out, r...)
+	}
+	return out, nil
+}
+
 func (pool *Pool) SubscribeNewHead(ctx context.Context, ch chan *types.Header) (ethereum.Subscription, error) {
 	p := pool.GetProvider()
 	if p == nil {
@@ -430,3 +679,4 @@ func (pool *Pool) PersistQuotaUsage(ctx context.Context, storage QuotaStorage) e
 }
 
 var _ ProviderPool = (*Pool)(nil)
+var _ ParallelBackfiller = (*Pool)(nil)

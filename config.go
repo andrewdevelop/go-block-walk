@@ -101,6 +101,22 @@ type PoolConfig struct {
 	// batching benefit) if zero or negative, so opting into real batching
 	// is a deliberate choice.
 	MaxLogBlockRange int
+
+	// MaxParallelJobAttempts bounds how many times a single sub-range job
+	// may be retried (against any available provider, not just the one that
+	// first failed it) during one Pool.LogsByBlockRangeParallel round before
+	// that job — and the whole round — is given up on. Guards against a
+	// sub-range that every provider rejects for a reason that doesn't trip
+	// its circuit breaker or exhaust its quota (so it keeps looking
+	// "available" and keeps being handed the job) bouncing between
+	// providers forever. Zero or negative (the default) means "use twice
+	// the number of providers taking part in that round" — i.e. every
+	// provider gets on average two independent chances at any given job
+	// before it's abandoned — recomputed per round since availability
+	// changes over time. Set this explicitly only if that default is wrong
+	// for your setup (e.g. many low-priority providers you'd rather fail
+	// fast past than cycle through).
+	MaxParallelJobAttempts int
 }
 
 // IndexerConfig configures an Indexer's polling behaviour. It carries no
