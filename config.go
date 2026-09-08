@@ -101,6 +101,37 @@ type PoolConfig struct {
 	// batching benefit) if zero or negative, so opting into real batching
 	// is a deliberate choice.
 	MaxLogBlockRange int
+
+	// MaxParallelJobAttempts bounds how many times a single sub-range job
+	// may be retried (against any available provider, not just the one that
+	// first failed it) during one Pool.LogsByBlockRangeParallel round before
+	// that job — and the whole round — is given up on. Guards against a
+	// sub-range that every provider rejects for a reason that doesn't trip
+	// its circuit breaker or exhaust its quota (so it keeps looking
+	// "available" and keeps being handed the job) bouncing between
+	// providers forever. Zero or negative (the default) means "use twice
+	// the number of providers taking part in that round" — i.e. every
+	// provider gets on average two independent chances at any given job
+	// before it's abandoned — recomputed per round since availability
+	// changes over time. Set this explicitly only if that default is wrong
+	// for your setup (e.g. many low-priority providers you'd rather fail
+	// fast past than cycle through).
+	MaxParallelJobAttempts int
+
+	// RangeTooLargeFilters lists additional substrings (matched
+	// case-insensitively against the error message, on top of always
+	// requiring "range" to appear somewhere in it) that mark an
+	// eth_getLogs error as "the provider rejected this range as too large",
+	// merged with the package's built-in keyword set — the same
+	// merge-with-defaults pattern as CircuitBreakerConfig.FilterErrors. Use
+	// this for a provider whose wording the built-in set misses (e.g.
+	// dRPC's free-plan limit reads "ranges over 10000 blocks are not
+	// supported on free plan" — no "large"/"limit"/"exceed"/"too many"
+	// keyword, so add "not supported" and/or "free plan" here). Recognizing
+	// this error is what lets Indexer.syncBlocksBatched split the chunk and
+	// retry instead of failing the whole sync; see isRangeTooLargeError and
+	// RangeTooLargeClassifier.
+	RangeTooLargeFilters []string
 }
 
 // IndexerConfig configures an Indexer's polling behaviour. It carries no

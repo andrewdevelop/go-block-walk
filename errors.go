@@ -22,6 +22,16 @@ func isLocalDecodeError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "transaction type not supported")
 }
 
+// defaultRangeTooLargeFilters lists the keywords isRangeTooLargeError
+// recognizes out of the box, on top of always requiring "range" to appear
+// somewhere in the error. Individual providers can word this rejection in
+// ways that slip past all of these (e.g. dRPC's free-plan limit reads
+// "ranges over 10000 blocks are not supported on free plan" — "range" is
+// there, but none of these keywords are) — see
+// PoolConfig.RangeTooLargeFilters for adding provider-specific wording
+// without waiting on a package update.
+var defaultRangeTooLargeFilters = []string{"large", "limit", "exceed", "too many"}
+
 // isRangeTooLargeError reports whether err indicates the RPC provider that
 // served an eth_getLogs call rejected it because the requested block range
 // exceeded what that specific provider allows (wording varies: "range too
@@ -32,7 +42,19 @@ func isLocalDecodeError(err error) bool {
 // under a failover racing the chunk-sizing call) — see
 // Indexer.syncBlocksBatched, which reacts to this by splitting the chunk
 // and retrying instead of failing the whole sync.
+//
+// This checks only the built-in keyword set. Pool.IsRangeTooLargeError (see
+// PoolConfig.RangeTooLargeFilters and RangeTooLargeClassifier) additionally
+// honours per-pool custom wording; Indexer prefers that when its
+// ProviderPool implements it, falling back to this otherwise.
 func isRangeTooLargeError(err error) bool {
+	return isRangeTooLargeErrorWithFilters(err, nil)
+}
+
+// isRangeTooLargeErrorWithFilters is isRangeTooLargeError extended with
+// caller-supplied extra keywords (matched case-insensitively, same as
+// defaultRangeTooLargeFilters), checked in addition to the built-in set.
+func isRangeTooLargeErrorWithFilters(err error, extraFilters []string) bool {
 	if err == nil {
 		return false
 	}
@@ -40,8 +62,13 @@ func isRangeTooLargeError(err error) bool {
 	if !strings.Contains(s, "range") {
 		return false
 	}
-	for _, kw := range []string{"large", "limit", "exceed", "too many"} {
+	for _, kw := range defaultRangeTooLargeFilters {
 		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	for _, kw := range extraFilters {
+		if strings.Contains(s, strings.ToLower(kw)) {
 			return true
 		}
 	}

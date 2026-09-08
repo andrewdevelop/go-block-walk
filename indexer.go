@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 )
 
 const (
@@ -373,7 +374,18 @@ func (idx *Indexer) syncBlocksSequential(startBlock, currentBlock uint64) error 
 // range-too-large split (the retrying flag below): the pool-wide/active-
 // provider value that produced the oversized request in the first place
 // would just undo the split and spin forever.
+//
+// If the pool implements ParallelBackfiller (see that interface), each
+// iteration first tries a parallel round: fan the next span out across
+// every currently available provider at once instead of serving it from
+// just the top-ranked one. It only does this when there's enough backlog
+// left to give more than one provider real work (remaining > a single
+// provider's chunk size) — a small tail end of the backfill, or a pool with
+// only one healthy provider, falls straight through to the ordinary
+// single-provider path below, which already handles those cases correctly.
 func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
+	parallelPool, supportsParallel := idx.pool.(ParallelBackfiller)
+
 	chunkSize := uint64(idx.pool.MaxLogBlockRange())
 	if chunkSize == 0 {
 		chunkSize = 1
@@ -381,6 +393,41 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 
 	retrying := false
 	for chunkStart := startBlock; chunkStart <= currentBlock; {
+		if supportsParallel {
+			remaining := currentBlock - chunkStart + 1
+			if providers, pChunk := parallelPool.ParallelLogPlan(); providers > 1 && pChunk > 0 && remaining > uint64(pChunk) {
+				span := uint64(pChunk) * uint64(providers)
+				if span > remaining {
+					span = remaining
+				}
+				chunkEnd := chunkStart + span - 1
+
+				idx.logger.Info("fetching logs for chunk via parallel backfill",
+					"from", chunkStart, "to", chunkEnd, "providers", providers, "perProviderChunk", pChunk)
+
+				logs, err := parallelPool.LogsByBlockRangeParallel(idx.ctx, chunkStart, chunkEnd)
+				if err != nil {
+					if !idx.isRangeTooLargeError(err) {
+						return fmt.Errorf("failed to get logs for parallel blocks %d..%d: %w", chunkStart, chunkEnd, err)
+					}
+					// Sizing already used the smallest available provider's
+					// own limit, so this means whichever provider actually
+					// ended up serving one of the sub-ranges has an even
+					// smaller one. Fall through to the sequential path below
+					// for this same chunkStart, which knows how to split and
+					// retry on exactly this error.
+					idx.logger.Warn("parallel backfill chunk rejected as too large, falling back to sequential batching for this round",
+						"from", chunkStart, "to", chunkEnd, "error", err)
+				} else {
+					if err := idx.applyBatchChunk(logs, chunkEnd); err != nil {
+						return err
+					}
+					chunkStart = chunkEnd + 1
+					continue
+				}
+			}
+		}
+
 		if !retrying {
 			if poolLimit := uint64(idx.pool.MaxLogBlockRange()); poolLimit > 0 {
 				chunkSize = poolLimit
@@ -397,7 +444,7 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 
 		logs, err := idx.pool.LogsByBlockRange(idx.ctx, chunkStart, chunkEnd)
 		if err != nil {
-			if isRangeTooLargeError(err) && chunkEnd > chunkStart {
+			if idx.isRangeTooLargeError(err) && chunkEnd > chunkStart {
 				// The provider that ended up serving this particular
 				// request (GetProvider is re-resolved independently by the
 				// pool on every call) has a smaller limit than whatever
@@ -415,48 +462,77 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 			return fmt.Errorf("failed to get logs for blocks %d..%d: %w", chunkStart, chunkEnd, err)
 		}
 
-		blockTimes := make(map[uint64]uint64, len(logs))
-		for _, l := range logs {
-			blockTime, ok := blockTimes[l.BlockNumber]
-			if !ok {
-				header, err := idx.pool.HeaderByNumber(idx.ctx, new(big.Int).SetUint64(l.BlockNumber))
-				if err != nil {
-					if isLocalDecodeError(err) {
-						idx.logger.Warn("skipping block permanently: unsupported transaction type (chain upgrade ahead of go-ethereum); its logs will not be indexed", "block", l.BlockNumber)
-					} else {
-						return fmt.Errorf("failed to get header for block %d: %w", l.BlockNumber, err)
-					}
-					blockTimes[l.BlockNumber] = 0
-					continue
-				}
-				blockTime = header.Time
-				blockTimes[l.BlockNumber] = blockTime
-			}
-
-			if blockTime == 0 {
-				// Header fetch for this block failed (unsupported tx type) — already warned above.
-				continue
-			}
-
-			if err := idx.dispatcher.Dispatch(l, blockTime); err != nil {
-				return fmt.Errorf("failed to dispatch log for block %d: %w", l.BlockNumber, err)
-			}
+		if err := idx.applyBatchChunk(logs, chunkEnd); err != nil {
+			return err
 		}
-
-		if idx.reorgDepth > 0 {
-			if header, err := idx.pool.HeaderByNumber(idx.ctx, new(big.Int).SetUint64(chunkEnd)); err == nil {
-				idx.recordBlockHash(chunkEnd, header.Hash())
-			}
-		}
-
-		if err := idx.storeLastBlock(chunkEnd); err != nil {
-			return fmt.Errorf("failed to save last block: %w", err)
-		}
-
-		idx.persistProviderState()
 
 		chunkStart = chunkEnd + 1
 	}
+
+	return nil
+}
+
+// isRangeTooLargeError classifies err as a provider rejecting an
+// eth_getLogs range as too large, preferring idx.pool's own classifier (see
+// RangeTooLargeClassifier and PoolConfig.RangeTooLargeFilters) when it
+// implements one — so provider-specific wording configured on the pool
+// (e.g. dRPC's free-plan message, which the package's built-in keyword set
+// doesn't recognize) is honoured here too — and falling back to the
+// package's default, non-configurable heuristic otherwise (e.g. for a
+// ProviderPool test fake that doesn't implement it).
+func (idx *Indexer) isRangeTooLargeError(err error) bool {
+	if c, ok := idx.pool.(RangeTooLargeClassifier); ok {
+		return c.IsRangeTooLargeError(err)
+	}
+	return isRangeTooLargeError(err)
+}
+
+// applyBatchChunk finishes processing one already-fetched batch of logs
+// covering up to chunkEnd: resolving each distinct block's timestamp,
+// dispatching every log, recording chunkEnd's hash for reorg detection, and
+// persisting sync progress. Shared by syncBlocksBatched's single-provider
+// and parallel-fan-out paths — neither how logs were fetched nor how many
+// providers served them changes what happens next.
+func (idx *Indexer) applyBatchChunk(logs []types.Log, chunkEnd uint64) error {
+	blockTimes := make(map[uint64]uint64, len(logs))
+	for _, l := range logs {
+		blockTime, ok := blockTimes[l.BlockNumber]
+		if !ok {
+			header, err := idx.pool.HeaderByNumber(idx.ctx, new(big.Int).SetUint64(l.BlockNumber))
+			if err != nil {
+				if isLocalDecodeError(err) {
+					idx.logger.Warn("skipping block permanently: unsupported transaction type (chain upgrade ahead of go-ethereum); its logs will not be indexed", "block", l.BlockNumber)
+				} else {
+					return fmt.Errorf("failed to get header for block %d: %w", l.BlockNumber, err)
+				}
+				blockTimes[l.BlockNumber] = 0
+				continue
+			}
+			blockTime = header.Time
+			blockTimes[l.BlockNumber] = blockTime
+		}
+
+		if blockTime == 0 {
+			// Header fetch for this block failed (unsupported tx type) — already warned above.
+			continue
+		}
+
+		if err := idx.dispatcher.Dispatch(l, blockTime); err != nil {
+			return fmt.Errorf("failed to dispatch log for block %d: %w", l.BlockNumber, err)
+		}
+	}
+
+	if idx.reorgDepth > 0 {
+		if header, err := idx.pool.HeaderByNumber(idx.ctx, new(big.Int).SetUint64(chunkEnd)); err == nil {
+			idx.recordBlockHash(chunkEnd, header.Hash())
+		}
+	}
+
+	if err := idx.storeLastBlock(chunkEnd); err != nil {
+		return fmt.Errorf("failed to save last block: %w", err)
+	}
+
+	idx.persistProviderState()
 
 	return nil
 }

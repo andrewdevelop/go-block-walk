@@ -211,6 +211,66 @@ func TestPool_MaxLogBlockRangeTracksFailover(t *testing.T) {
 	}
 }
 
+// TestPool_IsRangeTooLargeError_DefaultMissesDRPCWording documents the bug
+// report: dRPC's free-plan rejection ("ranges over 10000 blocks are not
+// supported on free plan") contains "range" but none of the built-in
+// keywords ("large"/"limit"/"exceed"/"too many"), so the default classifier
+// doesn't recognize it as a too-large-range error — Indexer.syncBlocksBatched
+// would treat it as an ordinary chunk failure instead of splitting and
+// retrying. See PoolConfig.RangeTooLargeFilters for the fix.
+func TestPool_IsRangeTooLargeError_DefaultMissesDRPCWording(t *testing.T) {
+	pool := mustNewPool(t, PoolConfig{Providers: []ProviderConfig{poolProviderConfig("a", 1, newFakeEthClient())}})
+	defer pool.Close()
+
+	err := errors.New("ranges over 10000 blocks are not supported on free plan")
+	if pool.IsRangeTooLargeError(err) {
+		t.Fatal("expected the default keyword set to miss dRPC's free-plan wording")
+	}
+}
+
+func TestPool_IsRangeTooLargeError_RangeTooLargeFiltersRecognizeCustomWording(t *testing.T) {
+	pool := mustNewPool(t, PoolConfig{
+		RangeTooLargeFilters: []string{"not supported on", "free plan"},
+		Providers:            []ProviderConfig{poolProviderConfig("a", 1, newFakeEthClient())},
+	})
+	defer pool.Close()
+
+	err := errors.New("ranges over 10000 blocks are not supported on free plan")
+	if !pool.IsRangeTooLargeError(err) {
+		t.Fatal("expected RangeTooLargeFilters to recognize dRPC's free-plan wording")
+	}
+}
+
+// TestPool_IsRangeTooLargeError_StillRequiresRangeSubstring proves
+// RangeTooLargeFilters extends, rather than replaces, the "range" substring
+// requirement: a configured filter keyword appearing without "range"
+// anywhere in the message must not match.
+func TestPool_IsRangeTooLargeError_StillRequiresRangeSubstring(t *testing.T) {
+	pool := mustNewPool(t, PoolConfig{
+		RangeTooLargeFilters: []string{"free plan"},
+		Providers:            []ProviderConfig{poolProviderConfig("a", 1, newFakeEthClient())},
+	})
+	defer pool.Close()
+
+	err := errors.New("not available on free plan")
+	if pool.IsRangeTooLargeError(err) {
+		t.Fatal("expected a configured filter keyword to still require \"range\" somewhere in the message")
+	}
+}
+
+func TestPool_IsRangeTooLargeError_BuiltInKeywordsStillWorkAlongsideCustomFilters(t *testing.T) {
+	pool := mustNewPool(t, PoolConfig{
+		RangeTooLargeFilters: []string{"free plan"},
+		Providers:            []ProviderConfig{poolProviderConfig("a", 1, newFakeEthClient())},
+	})
+	defer pool.Close()
+
+	err := errors.New("block range exceeds maximum")
+	if !pool.IsRangeTooLargeError(err) {
+		t.Fatal("expected the built-in keyword set to still apply alongside a custom RangeTooLargeFilters list")
+	}
+}
+
 func TestPool_LogsByBlockNumberAndRange(t *testing.T) {
 	client := newFakeEthClient()
 	client.setLogs([]types.Log{{BlockNumber: 5}})

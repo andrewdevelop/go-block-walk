@@ -97,6 +97,47 @@ type ProviderPool interface {
 	MaxLogBlockRange() int
 }
 
+// ParallelBackfiller is an optional capability of a ProviderPool: fanning a
+// single backfill range out across every currently available provider at
+// once, instead of serving it from just the top-ranked one. The Indexer
+// type-asserts its ProviderPool against this interface and uses it
+// opportunistically — a pool that doesn't implement it (e.g. a test fake)
+// simply never gets the parallel fast path, falling back to the ordinary
+// single-provider chunked batching.
+type ParallelBackfiller interface {
+	// ParallelLogPlan reports how many providers are currently available to
+	// fan a backfill out across, and the per-provider chunk size to use
+	// (the smallest MaxLogBlockRange among them — see ProviderConfig.
+	// MaxLogBlockRange and PoolConfig.MaxLogBlockRange for how an individual
+	// provider's limit is resolved). Either value can be 0 (no providers
+	// available); callers should not attempt a parallel round in that case.
+	ParallelLogPlan() (providers int, chunkSize int)
+
+	// LogsByBlockRangeParallel fetches logs for [fromBlock, toBlock] by
+	// splitting it into ParallelLogPlan's chunkSize-sized sub-ranges and
+	// dispatching them concurrently, each to a distinct available provider.
+	// If a provider fails or becomes unavailable (circuit-broken, quota
+	// exhausted) partway through, its outstanding sub-range is transparently
+	// reassigned to another available provider; the call only returns once
+	// every sub-range has succeeded, or once no available provider remains
+	// to serve one — the caller never observes a partial, out-of-order, or
+	// incomplete result. Returned logs are ordered the same way a single
+	// FilterLogs call over the whole range would order them (ascending by
+	// sub-range).
+	LogsByBlockRangeParallel(ctx context.Context, fromBlock, toBlock uint64) ([]types.Log, error)
+}
+
+// RangeTooLargeClassifier is an optional ProviderPool capability for
+// recognizing provider-specific "range too large" error wording beyond the
+// package's built-in heuristic (see PoolConfig.RangeTooLargeFilters and
+// isRangeTooLargeError). The Indexer type-asserts its ProviderPool against
+// this and prefers it when present, falling back to the package's default,
+// non-configurable classifier if the pool doesn't implement it (e.g. a test
+// fake) — the same optional-capability pattern as ScoreStorage/QuotaStorage.
+type RangeTooLargeClassifier interface {
+	IsRangeTooLargeError(err error) bool
+}
+
 // ChainStorage persists the indexer's core, chain-related state: sync
 // progress and the events it has already indexed. It is the only storage
 // capability the Indexer strictly requires — implement just this to back
