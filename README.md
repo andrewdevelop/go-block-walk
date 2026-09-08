@@ -54,6 +54,19 @@ import idx "github.com/andrewdevelop/go-block-walk"
   one-shot and safe to tear down twice: `Stop` is idempotent, and `Start`
   after `Stop` returns `ErrIndexerStopped` instead of silently doing
   nothing.
+- **Parallel multi-provider backfill** — when there's enough backlog to
+  give more than one provider real work, `Indexer` fans a batch out across
+  *every* currently available provider at once instead of serving it from
+  just the top-ranked one, sized to the smallest available provider's
+  `MaxLogBlockRange` (see [Parallel backfill
+  fan-out](#parallel-backfill-fan-out)). A provider that fails or drops out
+  mid-round has its sub-range transparently reassigned to another available
+  one; the caller only ever sees the complete, correctly-ordered batch or an
+  error — never a partial one.
+- **Configurable "range too large" detection** — providers word an
+  oversized-`eth_getLogs`-range rejection differently; `PoolConfig.RangeTooLargeFilters`
+  extends the built-in keyword set with your own, same pattern as
+  `CircuitBreakerConfig.FilterErrors` (see [`PoolConfig`](#poolconfig--the-provider-pool)).
 - **Pluggable, segregated storage** — `ChainStorage` (sync progress +
   indexed events) is the only thing you need to implement to back the
   indexer with your own database. `ScoreStorage` and `QuotaStorage` (health
@@ -69,7 +82,12 @@ import idx "github.com/andrewdevelop/go-block-walk"
 - **Everything is an interface** — `ProviderPool`, `RPCProvider`,
   `ChainStorage`, `ScoreStorage`, `QuotaStorage`, `QuotaRestorer`,
   `BlockchainListener`, `BlockchainEventDispatcher` — so any piece can be
-  swapped or faked independently in your own tests.
+  swapped or faked independently in your own tests. `ParallelBackfiller` and
+  `RangeTooLargeClassifier` follow the same optional-capability pattern as
+  `ScoreStorage`/`QuotaStorage`: `Pool` implements both, `Indexer` uses them
+  via a type assertion, and a `ProviderPool` that doesn't (e.g. a test fake)
+  simply falls back to the ordinary single-provider path and the package's
+  default classifier, respectively.
 
 ## Install
 
@@ -217,8 +235,17 @@ flowchart TD
   independently (per call, not per chunk), `Indexer`'s batched sync path
   also handles a provider-with-a-smaller-limit rejecting an
   already-in-flight chunk as "range too large": it splits that chunk in
-  half and retries instead of failing the whole sync. `NewPool` validates
-  its config and returns `(*Pool, error)`; `Close` is idempotent.
+  half and retries instead of failing the whole sync (recognizing that
+  rejection is itself customizable per pool — see `PoolConfig.RangeTooLargeFilters`
+  and `RangeTooLargeClassifier` below). `Pool` also implements
+  `ParallelBackfiller`: `LogsByBlockRangeParallel` fans a range out across
+  every currently available provider at once via a worker-per-provider pool
+  pulling sub-range jobs off a shared queue, reassigning a failed or
+  circuit-broken provider's job to another available one, and only
+  returning once every sub-range has succeeded (results reassembled in
+  ascending order) or once no available provider remains to make progress —
+  see [Parallel backfill fan-out](#parallel-backfill-fan-out). `NewPool`
+  validates its config and returns `(*Pool, error)`; `Close` is idempotent.
 - **`Indexer`** depends only on the `ProviderPool`, `ChainStorage` and
   `BlockchainEventDispatcher` interfaces — never on `Pool`/`Memory`
   directly — so you can inject fakes in your own tests exactly like this
@@ -349,6 +376,8 @@ backends](#custom-storage-backends).
 | `Providers`        | `[]ProviderConfig` | —       | **Required, at least one.** `NewPool` returns an error for an empty list or a duplicate/empty `Name`.                                                                                                  |
 | `UpdateInterval`   | `time.Duration`    | `30s`   | How often `Pool` re-ranks providers by health score/quota penalty.                                                                                                                                     |
 | `MaxLogBlockRange` | `int`              | `1`     | Pool-wide default eth_getLogs chunk size, used for any provider that doesn't set its own `ProviderConfig.MaxLogBlockRange` — also what decides whether `Indexer` uses the sequential or batched sync path (`Pool.MaxLogBlockRange() > 1` → batched). Zero or negative also falls back to `1`. |
+| `MaxParallelJobAttempts` | `int`        | `0` (→ `2 × providers in the round`) | Caps how many times a single sub-range job may be retried against *any* available provider during one parallel backfill round before that job — and the round — is given up on. See [Parallel backfill fan-out](#parallel-backfill-fan-out). |
+| `RangeTooLargeFilters` | `[]string`     | —       | Extra case-insensitive substrings (still requires `"range"` to appear too) that mark an `eth_getLogs` error as "range rejected as too large", merged with the built-in set — same pattern as `CircuitBreakerConfig.FilterErrors`. Use this for wording the built-in set misses, e.g. dRPC's free-plan message `"ranges over 10000 blocks are not supported on free plan"` needs `[]string{"not supported on", "free plan"}`. |
 
 Ranking is **`Priority` ascending first, health score descending only to
 break ties** between providers that share the same `Priority` — a
@@ -365,6 +394,74 @@ success recovers it. `recalculateScores` additionally applies a penalty
 that score during each `UpdateInterval` tick — `RecordFailure` itself
 skips its own penalty for an `ErrQuotaExceeded` result, so quota
 exhaustion isn't double-penalized.
+
+An error only counts as "range too large" if it contains the substring
+`"range"` **and** one of these built-in keywords, or one of your own
+`RangeTooLargeFilters`:
+
+```
+large, limit, exceed, too many
+```
+
+Recognizing this is what lets `Indexer.syncBlocksBatched` split an
+oversized chunk and retry instead of failing the whole sync — see
+`isRangeTooLargeError` and `RangeTooLargeClassifier` in [`errors.go`](errors.go)
+/ [`ports.go`](ports.go). `Pool` implements `RangeTooLargeClassifier` using
+its own `RangeTooLargeFilters`; `Indexer` prefers that over the
+non-configurable package default whenever its `ProviderPool` implements it.
+
+### Parallel backfill fan-out
+
+`Indexer.syncBlocksBatched` normally serves each chunk from a single
+provider (see [`PoolConfig.MaxLogBlockRange`](#poolconfig--the-provider-pool)
+above). If `Pool` (or any `ProviderPool` implementing the optional
+`ParallelBackfiller` interface) reports more than one currently available
+provider *and* there's more backlog left than a single provider's own
+chunk size, `Indexer` instead calls `LogsByBlockRangeParallel` to fan that
+round out across every available provider at once — sized to
+`chunkSize × len(available providers)`, where `chunkSize` is the *smallest*
+`MaxLogBlockRange` among them (so, e.g., Infura/Alchemy capped at 10 blocks
+and zan-amoy capped at 10000 in the same pool would size every sub-range at
+10, not 10000). A small remaining tail, or a pool with only one healthy
+provider, falls straight through to the ordinary single-provider chunked
+path instead — no special handling needed, it already covers those cases.
+
+Internally this is a worker-per-available-provider pool pulling sub-range
+jobs off a shared queue:
+
+- A job that fails gets pushed back onto the queue for a different (or, if
+  it recovers, the same) provider to pick up, up to
+  `PoolConfig.MaxParallelJobAttempts` times (default: twice the number of
+  providers taking part in that round) before the job — and the whole
+  round — is given up on. This bounds a sub-range that every provider
+  rejects for a reason that doesn't trip its circuit breaker or exhaust its
+  quota (so it keeps looking "available" and keeps being handed the job)
+  from bouncing forever.
+- A worker exits once its own provider stops being available
+  (circuit-broken, quota exhausted), shrinking the pool of active workers;
+  if that drops to zero before every job has succeeded, the round fails
+  with an error instead of hanging.
+- A job rejected with a "range too large" error (see above) fails the round
+  immediately rather than retrying — sizing already used the smallest
+  available provider's own limit, so this means whichever provider actually
+  served that sub-range (resolved independently, and possibly different
+  from the one active when the round was sized) has an even smaller one.
+  `Indexer` falls back to the ordinary single-provider chunked path for
+  that same `chunkStart`, which already knows how to split and retry on
+  exactly this error.
+- The round only ever returns once every sub-range has succeeded — results
+  are reassembled in ascending order, exactly matching what a single
+  `FilterLogs` call over the whole range would have produced — so callers
+  never observe a partial, out-of-order, or incomplete batch.
+
+The set of workers is fixed to whichever providers were available at the
+start of a given round: one that was down at that point and recovers
+before the round finishes doesn't get a worker spun up for it until the
+*next* round (`Indexer` re-queries `ParallelLogPlan` — and so re-sizes the
+next chunk — every iteration of `syncBlocksBatched`'s loop). This is
+deliberate: a round only ever spans `chunkSize × len(available)` blocks, so
+the window where a recovered provider sits idle is short-lived and
+self-corrects on the very next round.
 
 ### `IndexerConfig`
 
@@ -545,7 +642,12 @@ they test, so keeping test files in their own directory means testing
 through the public surface only, the same way any consumer of this module
 would.
 
-Most files are focused unit tests (one component at a time). One test,
+Most files are focused unit tests (one component at a time) —
+[`tests/pool_parallel_test.go`](tests/pool_parallel_test.go) is the one to
+read for the parallel backfill fan-out described above: splitting across
+providers with different `MaxLogBlockRange`s, reassigning a failed
+provider's job, a fully-exhausted pool failing the round, and the
+`MaxParallelJobAttempts` default/override. One test,
 [`tests/integration_test.go`](tests/integration_test.go)'s
 `TestIntegration_FullPipeline`, wires up a real `Pool` + `Provider` +
 `Memory` + `Indexer` + `EventDispatcher` together (only the JSON-RPC

@@ -22,12 +22,12 @@ the repo root as `package idx`, no subpackages:
 
 | File | Contents |
 |---|---|
-| `ports.go` | All exported interfaces (`RPCProvider`, `ProviderPool`, `ChainStorage`, `ScoreStorage`, `QuotaStorage`, `Storage`, `BlockchainListener`, `BlockchainEventDispatcher`) and their data types |
+| `ports.go` | All exported interfaces (`RPCProvider`, `ProviderPool`, `ChainStorage`, `ScoreStorage`, `QuotaStorage`, `Storage`, `BlockchainListener`, `BlockchainEventDispatcher`, `ParallelBackfiller`, `RangeTooLargeClassifier`) and their data types |
 | `config.go` | Config structs (`RateLimitConfig`, `CircuitBreakerConfig`, `RetryConfig`, `QuotaConfig`, `ProviderConfig`, `PoolConfig`, `IndexerConfig`) |
-| `errors.go` | Exported sentinel errors (`ErrNoAvailableProvider`, `ErrQuotaExceeded`, `ErrRetriesExhausted`, `ErrProviderPoolExhausted`, `ErrAlreadyRunning`) |
+| `errors.go` | Exported sentinel errors (`ErrNoAvailableProvider`, `ErrQuotaExceeded`, `ErrRetriesExhausted`, `ErrProviderPoolExhausted`, `ErrAlreadyRunning`) + the unexported `isRangeTooLargeError`/`isRangeTooLargeErrorWithFilters` classifier |
 | `ethclient.go` | `EthClient` interface (subset of `*ethclient.Client`) + `DialFunc`, so RPC calls are mockable in tests |
 | `provider.go` | `Provider` (rate limit → circuit breaker → retry → quota per RPC call) + unexported `QuotaManager` |
-| `pool.go` | `Pool` — ranks/selects `Provider`s by health score |
+| `pool.go` | `Pool` — ranks/selects `Provider`s by health score; also implements `ParallelBackfiller` (multi-provider backfill fan-out) and `RangeTooLargeClassifier` |
 | `ratelimit.go`, `breaker.go`, `retry.go` | Token-bucket limiter, circuit breaker, retry/backoff — each independently testable |
 | `dispatcher.go` | `EventDispatcher` — fans a log out to listeners, stops at first error |
 | `exhaustion.go` | `ExhaustionTracker` — counts consecutive "no provider available" attempts |
@@ -161,14 +161,33 @@ invariant unless the user explicitly asks to change it:
   new piece of persisted state, give it its own `Memory*Storage` type (own
   file, own constructor, own lock) and embed it into `Memory` — don't grow
   one of the existing three types to cover an unrelated concern.
-- **`PoolConfig.MaxLogBlockRange` is global, not per-provider.** RPC
-  providers used to each carry their own `MaxLogBlockRange`, and `Pool`
-  fell back to "the smallest configured value across providers" when picking
-  a chunk size — that complexity was deliberately removed. One value now
-  applies to every provider in the pool (default `DefaultMaxLogBlockRange`
-  = 1, i.e. no real batching until configured). Don't reintroduce a
-  per-provider override without being asked; if providers genuinely need
-  different limits, the caller should run separate `Pool`s.
+- **`ProviderConfig.MaxLogBlockRange` overrides `PoolConfig.MaxLogBlockRange`
+  per provider; `Pool.MaxLogBlockRange()` resolves the *currently active*
+  provider's own value, falling back to the pool-wide one.** (Earlier in
+  this package's history the per-provider override didn't exist and was
+  explicitly removed as unneeded complexity — it was later reintroduced,
+  deliberately this time, because a real pool mixing providers with very
+  different `eth_getLogs` limits — e.g. Infura/Alchemy capped at 10 blocks
+  next to a higher-tier provider accepting 10000 — needs it; a
+  higher-priority provider's larger limit must not be dragged down to a
+  weaker fallback provider's. Re-resolved on every call so it tracks
+  failover between providers with different limits instead of being pinned
+  to whichever value was computed at construction.) `Pool.ParallelLogPlan`
+  generalizes this further: the chunk size for a parallel round is the
+  *smallest* limit among every currently *available* provider (not just the
+  active one), since every provider taking part must be able to handle its
+  own sub-range.
+- **`ParallelBackfiller` and `RangeTooLargeClassifier` follow the same
+  optional-capability pattern as `ScoreStorage`/`QuotaStorage`.** `Pool`
+  implements both; `Indexer` checks for them via a type assertion
+  (`idx.pool.(ParallelBackfiller)`, `idx.pool.(RangeTooLargeClassifier)`)
+  and falls back to the ordinary single-provider chunked path / the
+  package's non-configurable `isRangeTooLargeError` respectively when a
+  `ProviderPool` doesn't implement one — never make either a required
+  method on `ProviderPool` itself. If you add another pool-level capability
+  Indexer should use opportunistically, follow the same shape: a small
+  standalone interface in `ports.go`, a type assertion at the point of use,
+  not a new required method on the big interface.
 - **Sequential vs. batched sync is derived, not separately configured.**
   `Indexer.syncBlocks` picks the path purely from
   `idx.pool.MaxLogBlockRange()`: `== 1` → sequential (`syncBlocksSequential`,
