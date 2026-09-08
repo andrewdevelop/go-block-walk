@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,8 +39,49 @@ type fakePool struct {
 	// smaller limit than the one syncBlocksBatched sized the chunk for.
 	maxAcceptedRange int
 
+	// oversizedRangeErrMsg overrides the error text FilterLogs returns once
+	// maxAcceptedRange is exceeded. Empty (the default) keeps the original
+	// "range too large: max %d blocks" wording, which the package's
+	// built-in isRangeTooLargeError keyword set already recognizes; tests
+	// exercising a pool's own custom RangeTooLargeFilters (via
+	// rangeTooLargeFilters below) set this to wording the built-in set
+	// would miss, e.g. dRPC's "ranges over N blocks are not supported on
+	// free plan".
+	oversizedRangeErrMsg string
+
+	// rangeTooLargeFilters, if non-empty, makes fakePool implement
+	// RangeTooLargeClassifier using these substrings (matched
+	// case-insensitively) in addition to a same-defaults fallback mirroring
+	// the package's own built-in keyword set — see IsRangeTooLargeError.
+	// Left nil (the default), classification still falls back to that same
+	// built-in-equivalent set, so existing tests that never touch this
+	// field keep seeing identical behaviour to before this field existed.
+	rangeTooLargeFilters []string
+
 	blockNumberCalls int
 	logsCalls        int
+}
+
+// IsRangeTooLargeError implements RangeTooLargeClassifier so tests can
+// exercise Indexer's use of a pool-specific classifier (see
+// PoolConfig.RangeTooLargeFilters) without needing a real *Pool. Mirrors
+// the package's own isRangeTooLargeError default keyword set as a fallback,
+// re-implemented here since that helper is unexported and this test package
+// only has access to idx's public surface.
+func (p *fakePool) IsRangeTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if !strings.Contains(s, "range") {
+		return false
+	}
+	for _, kw := range append([]string{"large", "limit", "exceed", "too many"}, p.rangeTooLargeFilters...) {
+		if strings.Contains(s, strings.ToLower(kw)) {
+			return true
+		}
+	}
+	return false
 }
 
 // newFakePool defaults maxRange to 1, mirroring PoolConfig.MaxLogBlockRange's
@@ -97,6 +139,9 @@ func (p *fakePool) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]ty
 	from := q.FromBlock.Uint64()
 	to := q.ToBlock.Uint64()
 	if p.maxAcceptedRange > 0 && to-from+1 > uint64(p.maxAcceptedRange) {
+		if p.oversizedRangeErrMsg != "" {
+			return nil, errors.New(p.oversizedRangeErrMsg)
+		}
 		return nil, fmt.Errorf("range too large: max %d blocks", p.maxAcceptedRange)
 	}
 	var out []types.Log
@@ -497,6 +542,49 @@ func TestIndexer_BatchedSyncSplitsChunkOnRangeTooLargeError(t *testing.T) {
 	}
 	if _, logsCalls := pool.callCounts(); logsCalls <= 4 {
 		t.Fatalf("expected more than the 4 chunks a clean 20/5 split would need, since the initial 20-block chunk had to be rejected and split first, got %d calls", logsCalls)
+	}
+}
+
+// TestIndexer_BatchedSyncSplitsChunkOnPoolCustomRangeTooLargeWording proves
+// the fix for the dRPC bug report: its free-plan rejection reads "ranges
+// over 10000 blocks are not supported on free plan" — "range" is there, but
+// none of the package's built-in isRangeTooLargeError keywords
+// ("large"/"limit"/"exceed"/"too many") are, so without a pool-specific
+// classifier this would be treated as an ordinary chunk failure instead of
+// being split and retried. Configuring the pool's RangeTooLargeFilters
+// (here simulated via fakePool.rangeTooLargeFilters, since fakePool isn't a
+// real *Pool) closes that gap: Indexer.isRangeTooLargeError prefers the
+// pool's own RangeTooLargeClassifier over the package default.
+func TestIndexer_BatchedSyncSplitsChunkOnPoolCustomRangeTooLargeWording(t *testing.T) {
+	pool := newFakePool()
+	pool.setBlockNumber(20)
+	pool.maxRange = 20
+	pool.maxAcceptedRange = 5
+	pool.oversizedRangeErrMsg = "ranges over 5 blocks are not supported on free plan"
+	pool.rangeTooLargeFilters = []string{"not supported on", "free plan"}
+	for b := uint64(1); b <= 20; b++ {
+		pool.addLog(b, types.Log{Address: common.HexToAddress("0x1")})
+	}
+
+	listener := &countingListener{}
+	store := NewMemory()
+	idx := newTestIndexer(t, IndexerConfig{
+		StartBlock: 0,
+	}, pool, store, NewEventDispatcher([]BlockchainListener{listener}))
+
+	if err := idx.Start(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer idx.Stop()
+	idx.Nudge()
+
+	waitFor(t, time.Second, func() bool {
+		last, _ := idx.GetLastBlock()
+		return last == 20
+	})
+
+	if got := listener.count(); got != 20 {
+		t.Fatalf("expected all 20 logs dispatched via split-and-retry recognizing the pool's custom wording, got %d", got)
 	}
 }
 

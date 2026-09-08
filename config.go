@@ -117,6 +117,21 @@ type PoolConfig struct {
 	// for your setup (e.g. many low-priority providers you'd rather fail
 	// fast past than cycle through).
 	MaxParallelJobAttempts int
+
+	// RangeTooLargeFilters lists additional substrings (matched
+	// case-insensitively against the error message, on top of always
+	// requiring "range" to appear somewhere in it) that mark an
+	// eth_getLogs error as "the provider rejected this range as too large",
+	// merged with the package's built-in keyword set — the same
+	// merge-with-defaults pattern as CircuitBreakerConfig.FilterErrors. Use
+	// this for a provider whose wording the built-in set misses (e.g.
+	// dRPC's free-plan limit reads "ranges over 10000 blocks are not
+	// supported on free plan" — no "large"/"limit"/"exceed"/"too many"
+	// keyword, so add "not supported" and/or "free plan" here). Recognizing
+	// this error is what lets Indexer.syncBlocksBatched split the chunk and
+	// retry instead of failing the whole sync; see isRangeTooLargeError and
+	// RangeTooLargeClassifier.
+	RangeTooLargeFilters []string
 }
 
 // IndexerConfig configures an Indexer's polling behaviour. It carries no

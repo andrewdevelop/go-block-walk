@@ -407,7 +407,7 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 
 				logs, err := parallelPool.LogsByBlockRangeParallel(idx.ctx, chunkStart, chunkEnd)
 				if err != nil {
-					if !isRangeTooLargeError(err) {
+					if !idx.isRangeTooLargeError(err) {
 						return fmt.Errorf("failed to get logs for parallel blocks %d..%d: %w", chunkStart, chunkEnd, err)
 					}
 					// Sizing already used the smallest available provider's
@@ -444,7 +444,7 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 
 		logs, err := idx.pool.LogsByBlockRange(idx.ctx, chunkStart, chunkEnd)
 		if err != nil {
-			if isRangeTooLargeError(err) && chunkEnd > chunkStart {
+			if idx.isRangeTooLargeError(err) && chunkEnd > chunkStart {
 				// The provider that ended up serving this particular
 				// request (GetProvider is re-resolved independently by the
 				// pool on every call) has a smaller limit than whatever
@@ -470,6 +470,21 @@ func (idx *Indexer) syncBlocksBatched(startBlock, currentBlock uint64) error {
 	}
 
 	return nil
+}
+
+// isRangeTooLargeError classifies err as a provider rejecting an
+// eth_getLogs range as too large, preferring idx.pool's own classifier (see
+// RangeTooLargeClassifier and PoolConfig.RangeTooLargeFilters) when it
+// implements one — so provider-specific wording configured on the pool
+// (e.g. dRPC's free-plan message, which the package's built-in keyword set
+// doesn't recognize) is honoured here too — and falling back to the
+// package's default, non-configurable heuristic otherwise (e.g. for a
+// ProviderPool test fake that doesn't implement it).
+func (idx *Indexer) isRangeTooLargeError(err error) bool {
+	if c, ok := idx.pool.(RangeTooLargeClassifier); ok {
+		return c.IsRangeTooLargeError(err)
+	}
+	return isRangeTooLargeError(err)
 }
 
 // applyBatchChunk finishes processing one already-fetched batch of logs

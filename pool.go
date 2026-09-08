@@ -35,6 +35,7 @@ type Pool struct {
 	updateInterval         time.Duration
 	maxLogBlockRange       int
 	maxParallelJobAttempts int
+	rangeTooLargeFilters   []string
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	wg                     sync.WaitGroup
@@ -78,6 +79,7 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 		updateInterval:         updateInterval,
 		maxLogBlockRange:       maxLogBlockRange,
 		maxParallelJobAttempts: cfg.MaxParallelJobAttempts,
+		rangeTooLargeFilters:   cfg.RangeTooLargeFilters,
 		ctx:                    ctx,
 		cancel:                 cancel,
 	}
@@ -377,6 +379,14 @@ func (pool *Pool) effectiveMaxLogBlockRange(p *Provider) int {
 	return pool.maxLogBlockRange
 }
 
+// IsRangeTooLargeError implements RangeTooLargeClassifier: the package's
+// default isRangeTooLargeError heuristic, extended with this pool's
+// PoolConfig.RangeTooLargeFilters for provider-specific wording the
+// built-in keyword set doesn't recognize.
+func (pool *Pool) IsRangeTooLargeError(err error) bool {
+	return isRangeTooLargeErrorWithFilters(err, pool.rangeTooLargeFilters)
+}
+
 // ParallelLogPlan implements ParallelBackfiller.
 func (pool *Pool) ParallelLogPlan() (providers int, chunkSize int) {
 	available := pool.availableProvidersSnapshot()
@@ -507,7 +517,7 @@ func (pool *Pool) LogsByBlockRangeParallel(ctx context.Context, fromBlock, toBlo
 					if err != nil {
 						pool.RecordFailure(p, err)
 
-						if isRangeTooLargeError(err) {
+						if pool.IsRangeTooLargeError(err) {
 							// Sizing already used the smallest available
 							// provider's limit, so this means the provider
 							// that actually served it (resolved independently
@@ -680,3 +690,4 @@ func (pool *Pool) PersistQuotaUsage(ctx context.Context, storage QuotaStorage) e
 
 var _ ProviderPool = (*Pool)(nil)
 var _ ParallelBackfiller = (*Pool)(nil)
+var _ RangeTooLargeClassifier = (*Pool)(nil)
