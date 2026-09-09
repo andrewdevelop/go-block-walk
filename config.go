@@ -1,6 +1,10 @@
 package idx
 
-import "time"
+import (
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+)
 
 // RateLimitConfig configures the token-bucket rate limiter applied to a
 // provider's outgoing RPC calls.
@@ -132,6 +136,24 @@ type PoolConfig struct {
 	// retry instead of failing the whole sync; see isRangeTooLargeError and
 	// RangeTooLargeClassifier.
 	RangeTooLargeFilters []string
+
+	// LogAddresses restricts every eth_getLogs call the pool makes (single,
+	// batched and parallel-backfill alike) to these contract addresses.
+	// Left empty (the default), a call spans every contract on chain — for
+	// an indexer that only cares about a handful of contracts, that pulls
+	// and JSON-decodes orders of magnitude more data than needed once
+	// MaxLogBlockRange spans more than a handful of blocks on an active
+	// chain, which can make a single call take far longer than
+	// ProviderConfig.RequestTimeout without ever erroring out (the timeout
+	// bounds the RPC round trip, not how large the matched log set is).
+	// Maps directly onto ethereum.FilterQuery.Addresses.
+	LogAddresses []common.Address
+
+	// LogTopics restricts every eth_getLogs call the same way LogAddresses
+	// does, for topic0 (event signature) filtering. Maps directly onto
+	// ethereum.FilterQuery.Topics — see that field's semantics (each
+	// position is OR'd internally, positions are AND'd together).
+	LogTopics [][]common.Hash
 }
 
 // IndexerConfig configures an Indexer's polling behaviour. It carries no

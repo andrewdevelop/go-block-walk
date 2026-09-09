@@ -36,6 +36,8 @@ type Pool struct {
 	maxLogBlockRange       int
 	maxParallelJobAttempts int
 	rangeTooLargeFilters   []string
+	logAddresses           []common.Address
+	logTopics              [][]common.Hash
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	wg                     sync.WaitGroup
@@ -80,6 +82,8 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 		maxLogBlockRange:       maxLogBlockRange,
 		maxParallelJobAttempts: cfg.MaxParallelJobAttempts,
 		rangeTooLargeFilters:   cfg.RangeTooLargeFilters,
+		logAddresses:           cfg.LogAddresses,
+		logTopics:              cfg.LogTopics,
 		ctx:                    ctx,
 		cancel:                 cancel,
 	}
@@ -289,11 +293,21 @@ func (pool *Pool) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]typ
 	return result, nil
 }
 
+// logFilterQuery builds a FilterQuery for [fromBlock, toBlock], scoped to
+// PoolConfig.LogAddresses/LogTopics if the pool was configured with either
+// — see those fields' docs for why an unscoped query gets expensive fast
+// once MaxLogBlockRange spans more than a handful of blocks.
+func (pool *Pool) logFilterQuery(fromBlock, toBlock uint64) ethereum.FilterQuery {
+	return ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(fromBlock),
+		ToBlock:   new(big.Int).SetUint64(toBlock),
+		Addresses: pool.logAddresses,
+		Topics:    pool.logTopics,
+	}
+}
+
 func (pool *Pool) LogsByBlockNumber(ctx context.Context, blockNum uint64) ([]types.Log, error) {
-	return pool.FilterLogs(ctx, ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(blockNum),
-		ToBlock:   new(big.Int).SetUint64(blockNum),
-	})
+	return pool.FilterLogs(ctx, pool.logFilterQuery(blockNum, blockNum))
 }
 
 // LogsByBlockRange fetches logs for [fromBlock, toBlock] in a single
@@ -301,10 +315,7 @@ func (pool *Pool) LogsByBlockNumber(ctx context.Context, blockNum uint64) ([]typ
 // the range using MaxLogBlockRange first — this does not split oversized
 // ranges itself.
 func (pool *Pool) LogsByBlockRange(ctx context.Context, fromBlock, toBlock uint64) ([]types.Log, error) {
-	return pool.FilterLogs(ctx, ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(fromBlock),
-		ToBlock:   new(big.Int).SetUint64(toBlock),
-	})
+	return pool.FilterLogs(ctx, pool.logFilterQuery(fromBlock, toBlock))
 }
 
 // MaxLogBlockRange returns the eth_getLogs chunk size to use next: the
@@ -510,10 +521,7 @@ func (pool *Pool) LogsByBlockRangeParallel(ctx context.Context, fromBlock, toBlo
 						return
 					}
 
-					logs, err := p.FilterLogs(runCtx, ethereum.FilterQuery{
-						FromBlock: new(big.Int).SetUint64(job.from),
-						ToBlock:   new(big.Int).SetUint64(job.to),
-					})
+					logs, err := p.FilterLogs(runCtx, pool.logFilterQuery(job.from, job.to))
 					if err != nil {
 						pool.RecordFailure(p, err)
 
